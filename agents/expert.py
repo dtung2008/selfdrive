@@ -218,10 +218,13 @@ class ExpertAgent(Agent):
     def _longitudinal_decision(self, ego_speed, leader) -> LongitudinalAction:
         """Decide whether to accelerate, decelerate, or maintain speed.
 
-        The logic follows a simplified Intelligent Driver Model (IDM):
+        The logic follows a simplified Intelligent Driver Model (IDM) with
+        physics-based stopping distance:
 
-        * If a leader exists within ``safe_distance`` **and** is approaching
-          (negative relative speed), decelerate.
+        * If a leader exists and the gap is below the *effective* safe
+          distance (which accounts for closing speed), decelerate. The
+          effective distance is ``max(safe_distance, stopping_distance)``
+          where ``stopping_distance = v_closing² / (2 * max_decel) + 5m``.
         * If a leader exists within ``safe_distance`` but is not approaching,
           hold speed (gap is small but stable).
         * Otherwise, accelerate toward ``desired_speed`` with a small
@@ -235,16 +238,31 @@ class ExpertAgent(Agent):
         Returns:
             A :class:`LongitudinalAction` enum value.
         """
-        if leader is not None and leader["rel_x"] < self.safe_distance:
-            # Within the safety envelope -- check if closing in.
-            if leader["rel_speed"] < 0:
-                # rel_speed < 0 means leader is slower than ego, so the
-                # gap is shrinking.  Brake to avoid collision.
+        if leader is not None:
+            gap = leader["rel_x"]
+            # Physics-based safe distance: when closing on a slower leader,
+            # account for the kinematic stopping distance needed to match
+            # speeds. Two components (take the max):
+            #   1. Base safe_distance (20m default)
+            #   2. Stopping distance: v_closing² / (2 * max_decel) + buffer
+            # The stopping distance term prevents late-braking collisions
+            # when approaching a much slower vehicle at high speed (e.g.,
+            # ego at 30 m/s, leader at 17 m/s → need ~22m to stop safely).
+            closing_speed = max(-leader["rel_speed"], 0.0)
+            max_decel = 5.0  # VehicleConfig.max_deceleration
+            # Buffer of 10m covers vehicle length (4.5m), discrete timestep
+            # quantization error (~0.6m), and safety margin.
+            stopping_dist = (closing_speed ** 2) / (2 * max_decel) + 10.0
+            effective_safe = max(self.safe_distance, stopping_dist)
+
+            if gap < effective_safe and leader["rel_speed"] < 0:
+                # Closing and within the safety envelope -- brake.
                 return LongitudinalAction.DECELERATE
-            else:
+            if gap < self.safe_distance and leader["rel_speed"] >= 0:
                 # Gap is small but not closing -- coast to keep it stable.
                 return LongitudinalAction.KEEP
-        elif ego_speed < self.desired_speed - 0.5:
+
+        if ego_speed < self.desired_speed - 0.5:
             # Open road and below cruise speed -- speed up.
             return LongitudinalAction.ACCELERATE
         elif ego_speed > self.desired_speed + 2.0:

@@ -114,10 +114,10 @@ class BCAgent(Agent):
            (same-lane gap < 10m), clearance thresholds are relaxed to
            allow evasive maneuvers.
 
-        2. Forced braking: If the same-lane gap ahead is below a
-           speed-dependent safe following distance (half-second rule)
-           or below an absolute 10m minimum, the action is overridden
-           to brake.
+        2. Three-state following distance: Uses physics-based stopping
+           distance (closing_speed² / 2a + buffer) when closing on a
+           slower vehicle, caps at KEEP when gap is small but stable,
+           and always brakes below 10m absolute minimum.
 
         Args:
             obs: The raw (un-normalized) observation vector.
@@ -145,11 +145,15 @@ class BCAgent(Agent):
         min_target_ahead = float('inf')   # closest NPC ahead in target lane
         min_target_behind = float('inf')  # closest NPC behind in target lane
 
-        # Scan all NPC slots to find the closest relevant vehicles
+        # Scan all NPC slots to find the closest relevant vehicles.
+        # Also track closing speed to the nearest same-lane NPC ahead for
+        # physics-based stopping distance calculation.
+        closing_speed_ahead = 0.0  # positive = ego approaching NPC
         for i in range(k):
             base = 3 + i * 4
             rel_x = obs[base]          # longitudinal distance (positive = ahead)
             rel_lane = obs[base + 1]   # lane offset from ego
+            rel_speed = obs[base + 2]  # npc_speed - ego_speed (negative = closing)
             exists = obs[base + 3]     # 1.0 if this NPC slot is occupied
 
             # Skip empty NPC slots (exists acts as a validity flag)
@@ -158,9 +162,12 @@ class BCAgent(Agent):
 
             npc_lane = ego_lane + rel_lane
 
-            # Same-lane ahead check: track the closest vehicle in our lane
+            # Same-lane ahead check: track the closest vehicle and its
+            # closing speed
             if abs(rel_lane) < 0.5 and rel_x > 0:
-                min_gap_ahead = min(min_gap_ahead, rel_x)
+                if rel_x < min_gap_ahead:
+                    min_gap_ahead = rel_x
+                    closing_speed_ahead = max(-rel_speed, 0.0)
 
             # Target lane check (only relevant if a lane change is requested):
             # track the closest vehicle ahead and behind in the lane we want
@@ -187,16 +194,30 @@ class BCAgent(Agent):
                 if min_target_ahead < 15.0 or min_target_behind < 15.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
 
-        # Speed-dependent following distance check: use the "half-second rule"
-        # where safe_gap = speed * 0.5s (e.g., 15m at 30 m/s)
-        safe_gap = ego_speed * 0.5
-        if min_gap_ahead < safe_gap:
-            if action.longitudinal != LongitudinalAction.DECELERATE:
-                return Action(LongitudinalAction.DECELERATE, action.lateral)
+        # Three-state following distance logic (same-lane only), matching
+        # the expert agent's physics-based approach:
+        #
+        # State 1 - CLOSING: Use physics-based stopping distance to decide
+        #   when to brake. Accounts for closing speed via kinematic formula.
+        # State 2 - STABLE: Gap is small but not closing. Cap at KEEP to
+        #   prevent re-accelerating, but don't force braking.
+        # State 3 - CRITICAL: Gap < 10m — always brake.
+        max_decel = 5.0  # VehicleConfig.max_deceleration
 
-        # Absolute minimum distance override: if gap < 10m, always brake
-        # regardless of speed (handles low-speed scenarios where the
-        # half-second rule would allow very small gaps)
+        if closing_speed_ahead > 0.5:
+            # Closing: physics-based safe distance
+            stopping_dist = (closing_speed_ahead ** 2) / (2 * max_decel) + 10.0
+            safe_gap = max(ego_speed * 0.7, 20.0, stopping_dist)
+            if min_gap_ahead < safe_gap:
+                if action.longitudinal != LongitudinalAction.DECELERATE:
+                    return Action(LongitudinalAction.DECELERATE, action.lateral)
+        else:
+            # Not closing: prevent acceleration if gap is still small
+            if min_gap_ahead < 20.0:
+                if action.longitudinal == LongitudinalAction.ACCELERATE:
+                    return Action(LongitudinalAction.KEEP, action.lateral)
+
+        # Absolute minimum distance override: always brake if gap < 10m
         if min_gap_ahead < 10.0:
             return Action(LongitudinalAction.DECELERATE, action.lateral)
 

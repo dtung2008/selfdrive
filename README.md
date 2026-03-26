@@ -121,6 +121,7 @@ selfdrive/
 ├── test_wm_horizon.py              # WM planner error-compounding test across horizons
 ├── verify_wm_rollout.py            # Hybrid WM rollout accuracy vs true simulator
 ├── debug_planner_decision.py        # Planner reward breakdown at stuck/slow steps
+├── scan_failures.py                 # Scan seed ranges for agent failure episodes
 ├── debug_viewer.html                # Browser-based episode visualization (loads JSON replays)
 ├── requirements.txt                 # Dependencies: numpy, torch, pytest
 └── .gitignore
@@ -174,13 +175,13 @@ python run_comparison.py
 
 ```bash
 python run_comparison.py \
-  --num-lanes 3 \              # Number of highway lanes (default: 2)
-  --num-npcs 8 \               # Number of NPC vehicles (default: 8)
+  --num-lanes 2 \              # Number of highway lanes (default: 2)
+  --num-npcs 6 \               # Number of NPC vehicles (default: 6)
   --collect-episodes 50 \      # Expert episodes for training data (default: 50)
-  --bc-epochs 80 \             # Behavior cloning training epochs (default: 80)
-  --wm-epochs 80 \             # World model training epochs (default: 80)
+  --bc-epochs 200 \             # Behavior cloning training epochs (default: 200)
+  --wm-epochs 20 \             # World model training epochs (default: 20)
   --rl-episodes 300 \          # REINFORCE training episodes (default: 300)
-  --eval-episodes 30           # Evaluation episodes per agent (default: 30)
+  --eval-episodes 30           # Evaluation episodes per agent (default: 20)
 ```
 
 ### Pipeline Steps
@@ -246,6 +247,23 @@ python test_wm_horizon.py
 # Step-by-step comparison: hybrid WM rollout vs true simulator
 python verify_wm_rollout.py
 ```
+
+### Scan for Failure Seeds
+
+Train an agent once, then run it across a range of seeds. Only outputs debug JSON for episodes that end early (collisions or other early terminations), skipping full-length episodes silently. Useful for hunting down rare failure modes without manually trying seeds one at a time:
+
+```bash
+# Scan seeds 0-100 for planner_wm failures
+python scan_failures.py --agent planner_wm --seeds 0-100
+
+# Scan with specific config
+python scan_failures.py --agent bc --seeds 0-50 --num-lanes 1
+
+# Save failure JSON files to a directory
+python scan_failures.py --agent planner_wm --seeds 0-200 --wm-epochs 80 --output-dir failures/
+```
+
+Output includes a summary of failure rate and per-failure JSON files compatible with `debug_viewer.html`.
 
 ### Planner Decision Debugging
 

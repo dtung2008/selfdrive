@@ -523,8 +523,11 @@ class PlannerLearnedModel(Agent):
         lateral = action.lateral.value
         target_lane = ego_lane + lateral
 
-        # Scan all NPCs to find minimum gaps in the current and target lanes
+        # Scan all NPCs to find minimum gaps in the current and target lanes.
+        # Also track the closing speed to the nearest same-lane NPC ahead,
+        # which is needed for physics-based stopping distance.
         min_gap_ahead = float('inf')      # closest NPC ahead in ego's lane
+        closing_speed_ahead = 0.0         # closing speed to that NPC (positive = approaching)
         min_target_ahead = float('inf')   # closest NPC ahead in target lane
         min_target_behind = float('inf')  # closest NPC behind in target lane
 
@@ -532,14 +535,19 @@ class PlannerLearnedModel(Agent):
             base = 3 + i * 4
             rel_x = obs[base]
             rel_lane = obs[base + 1]
+            rel_speed = obs[base + 2]     # npc_speed - ego_speed (negative = closing)
             exists = obs[base + 3]
             if exists < 0.5:
                 continue
             npc_lane = ego_lane + rel_lane
 
-            # Same-lane ahead: track the closest vehicle in our lane
+            # Same-lane ahead: track the closest vehicle and its closing speed
             if abs(rel_lane) < 0.5 and rel_x > 0:
-                min_gap_ahead = min(min_gap_ahead, rel_x)
+                if rel_x < min_gap_ahead:
+                    min_gap_ahead = rel_x
+                    # rel_speed = npc_speed - ego_speed, so negative means
+                    # ego is faster (closing). Convert to positive closing speed.
+                    closing_speed_ahead = max(-rel_speed, 0.0)
 
             # Target lane: track gaps for the lane we want to merge into
             if lateral != 0 and abs(npc_lane - target_lane) < 0.5:
@@ -564,14 +572,38 @@ class PlannerLearnedModel(Agent):
                 if min_target_ahead < 15.0 or min_target_behind < 15.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
 
-        # Speed-dependent following distance (same-lane only): 0.7-second rule
-        # (e.g., ~21m at 30 m/s, ~14m at 20 m/s). This aligns with the expert
-        # agent's safe_distance (~20m) so the planner starts braking at the
-        # same time the expert would.
-        safe_gap = ego_speed * 0.7
-        if min_gap_ahead < safe_gap:
-            if action.longitudinal != LongitudinalAction.DECELERATE:
-                action = Action(LongitudinalAction.DECELERATE, action.lateral)
+        # Three-state following distance logic (same-lane only), mirroring
+        # the expert agent's IDM-inspired approach:
+        #
+        # State 1 - CLOSING (closing_speed > 0.5 m/s): Use physics-based
+        #   stopping distance to decide when to brake. The safe gap is the max
+        #   of time-headway (0.7s), a 20m floor, and the kinematic stopping
+        #   distance (v_closing² / 2a + buffer). Force DECELERATE if violated.
+        #
+        # State 2 - STABLE (not closing, gap < 20m): Gap is small but not
+        #   shrinking — speeds are matched. Cap action at KEEP to prevent
+        #   re-accelerating into the NPC, but don't force braking. This avoids
+        #   the oscillation where forced braking overshoots, opens a huge gap,
+        #   then ego re-accelerates and repeats.
+        #
+        # State 3 - CRITICAL (gap < 10m): Always brake regardless of closing
+        #   speed — too close for comfort at any speed differential.
+        max_decel = self.vc.max_deceleration  # 5.0 m/s²
+
+        if closing_speed_ahead > 0.5:
+            # Closing: physics-based safe distance
+            stopping_dist = (closing_speed_ahead ** 2) / (2 * max_decel) + 10.0
+            safe_gap = max(ego_speed * 0.7, 20.0, stopping_dist)
+            if min_gap_ahead < safe_gap:
+                if action.longitudinal != LongitudinalAction.DECELERATE:
+                    action = Action(LongitudinalAction.DECELERATE, action.lateral)
+        else:
+            # Not closing: gap is stable or opening. Prevent acceleration
+            # if gap is still under the safe threshold, but allow KEEP so
+            # ego matches NPC speed without overshooting downward.
+            if min_gap_ahead < 20.0:
+                if action.longitudinal == LongitudinalAction.ACCELERATE:
+                    action = Action(LongitudinalAction.KEEP, action.lateral)
 
         # Absolute minimum gap override: always brake if gap < 10m
         if min_gap_ahead < 10.0:
@@ -657,17 +689,25 @@ class PlannerLearnedModel(Agent):
             collision = same_lane & (np.abs(raw_gap) < 8.0)
             rewards[collision] = -100.0
 
-            # Check 2: Same-lane too close ahead -- need safe following distance.
-            # 0.7-second rule (~21m at 30 m/s, ~14m at 20 m/s), matching the
-            # expert agent's safe_distance and the _apply_safety threshold.
-            # Reward is set to -10 to strongly discourage closing the gap,
-            # making braking clearly preferable to maintaining speed (which
-            # gives ~+1.0 reward). Previously clamped to 0, which was too
-            # close to the speed reward to influence the planner's decision.
+            # Check 2: Same-lane too close ahead -- three-state logic matching
+            # _apply_safety. Only penalize when actually closing on the NPC;
+            # stable/opening gaps at moderate distance are acceptable.
             ahead = same_lane & (raw_gap > 0)
-            min_gap = ego_speeds * 0.7  # 0.7-second following distance
-            too_close = ahead & (raw_gap < min_gap)
-            rewards[too_close] = np.minimum(rewards[too_close], -10.0)
+            closing_speed = np.maximum(ego_speeds - npc_speeds[:, n], 0.0)
+            closing = closing_speed > 0.5
+
+            # 2a: Closing approach -- physics-based safe distance.
+            # Penalize rollouts where ego is closing too fast on a slower NPC.
+            max_decel = 5.0  # self.vc.max_deceleration
+            stopping_dist = (closing_speed ** 2) / (2 * max_decel) + 10.0
+            min_gap = np.maximum(np.maximum(ego_speeds * 0.7, 20.0), stopping_dist)
+            too_close_closing = ahead & closing & (raw_gap < min_gap)
+            rewards[too_close_closing] = np.minimum(rewards[too_close_closing], -10.0)
+
+            # 2b: Stable/opening gap but critically close (< 10m) -- still
+            # dangerous even if not actively closing.
+            critically_close = ahead & ~closing & (raw_gap < 10.0)
+            rewards[critically_close] = np.minimum(rewards[critically_close], -10.0)
 
         # Check 3: Lane change into occupied space.
         # If ego just changed lanes, check that the target lane has
