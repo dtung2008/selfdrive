@@ -2,8 +2,28 @@
 """
 Record a detailed episode for visual debugging.
 
-Outputs a JSON file with per-step state for the visual debugger.
-Supports all agent types with configurable parameters.
+This is an enhanced version of record_episodes.py that captures additional
+per-frame diagnostic data for every agent type.  On top of the basic state
+snapshot (ego, NPCs, reward, collision), each frame also includes:
+
+  - expert_action : the action the rule-based expert *would* have taken at
+    this observation, enabling side-by-side comparison with the tested agent.
+  - lane_gaps     : for every lane, the closest NPC ahead and behind the ego
+    vehicle (in metres).  Useful for understanding gap-selection behaviour.
+  - disagree      : boolean flag that is True when the agent's chosen action
+    differs from the expert's, making it easy to spot divergence in the viewer.
+  - gap_ahead / gap_behind : current-lane gaps kept for backward compatibility.
+  - cumulative_reward : running reward total so the viewer can plot a reward
+    curve alongside the animation.
+
+The output JSON wraps the frame list with a version tag, full config, training
+metadata (agent_info), and an episode summary.  It is consumed by
+debug_viewer.html for interactive step-through visualisation.
+
+Supports all agent types: expert, bc, rl, planner_true, planner_wm.  Learned
+agents (bc, rl, planner_wm) are trained from scratch each run using expert
+demonstration data, so the output is fully self-contained and reproducible
+given the same seeds.
 
 Usage:
     python record_debug.py --agent expert --seed 42 --num-lanes 2 --output debug_episode.json
@@ -37,26 +57,47 @@ from training.rl_trainer import RLTrainer
 
 
 def make_config(args):
+    """Build a Config with CLI overrides applied.
+
+    Overrides road geometry (num_lanes, num_npcs, episode length) from args.
+    Also adjusts the NPC traffic behaviour mix based on lane count:
+      - 1 lane:  all NPCs use the "medium" behaviour (no lane changes possible)
+      - 2+ lanes: mostly "fast" NPCs with some "medium", creating overtaking
+        scenarios that stress-test lane-change decisions.
+    """
     cfg = Config()
     cfg.road.num_lanes = args.num_lanes
     cfg.traffic.num_npcs = args.num_npcs
     cfg.sim.episode_steps = args.max_steps
     if args.num_lanes == 1:
+        # Single lane: no aggressive NPCs (lane changes impossible)
         cfg.traffic.behavior_mix = [0.0, 1.0, 0.0]
     else:
+        # Multi-lane: heavier weight on fast NPCs to create interesting gaps
         cfg.traffic.behavior_mix = [0.0, 0.3, 0.7]
     return cfg
 
 
 def build_agent(args, cfg, obs_dim):
-    """Build the requested agent, training if necessary."""
+    """Build the requested agent, training if necessary.
+
+    For the expert agent no training is needed -- it uses hand-crafted rules.
+    All learned agents first collect expert demonstration data, then train
+    their respective models before returning a ready-to-evaluate agent.
+
+    Returns (agent, info) where info is a dict of training metadata that
+    gets written into the output JSON for provenance.
+    """
     expert = ExpertAgent(obs_config=cfg.obs, num_lanes=cfg.road.num_lanes)
     info = {"agent_type": args.agent}
 
+    # --- Expert: rule-based, no training required ---
     if args.agent == "expert":
         return expert, info
 
-    # All other agents need expert data
+    # --- Collect expert demonstrations (shared by all learned agents) ---
+    # The expert drives the simulator for N episodes; the resulting
+    # (obs, action, reward, next_obs, done) tuples form the training set.
     print(f"Collecting {args.collect_episodes} expert episodes...")
     sim_c = Simulator(cfg, seed=args.train_seed)
     collector = DataCollector(sim_c, expert)
@@ -64,6 +105,10 @@ def build_agent(args, cfg, obs_dim):
     obs_data, act_data, rew_data, nobs_data, done_data = trajectories_to_arrays(trajs)
     info["train_transitions"] = len(obs_data)
 
+    # --- Behavioural Cloning (BC): supervised learning on expert actions ---
+    # Trains a policy network to predict the expert's action from each
+    # observation using cross-entropy loss.  The resulting agent is wrapped
+    # in BCAgent with deterministic=True (argmax, no sampling).
     if args.agent == "bc":
         print(f"Training BC ({args.bc_epochs} epochs)...")
         policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
@@ -72,6 +117,12 @@ def build_agent(args, cfg, obs_dim):
         info["bc_final_loss"] = losses[-1]
         return BCAgent(policy, deterministic=True, normalizer=normalizer), info
 
+    # --- Reinforcement Learning (RL): BC warm-start then policy gradient ---
+    # Two-phase training pipeline:
+    #   1. Pre-train a policy via BC so it starts from a reasonable baseline.
+    #   2. Fine-tune with REINFORCE (policy gradient) using environment reward,
+    #      reusing the BC observation normalizer for stable inputs.
+    # The final policy is evaluated deterministically through BCAgent.
     if args.agent == "rl":
         print(f"Training BC for warm-start ({args.bc_epochs} epochs)...")
         bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
@@ -89,6 +140,10 @@ def build_agent(args, cfg, obs_dim):
         info["rl_final_avg_reward"] = float(np.mean(rewards[-50:]))
         return BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer), info
 
+    # --- Planner with true model: random-shooting MPC using the real sim ---
+    # Uses the actual simulator as a perfect forward model.  At each step it
+    # generates random action sequences, rolls them out in a cloned sim, and
+    # picks the sequence with the highest cumulative reward.
     if args.agent == "planner_true":
         mc = ModelConfig()
         mc.planner_horizon = args.planner_horizon
@@ -98,6 +153,11 @@ def build_agent(args, cfg, obs_dim):
         info["planner_rollouts"] = mc.planner_num_rollouts
         return PlannerTrueModel(sim_p, mc, seed=args.seed), info
 
+    # --- Planner with learned world model: MPC using an attention-based WM ---
+    # First trains a transformer world model to predict next observations from
+    # (obs, action) pairs.  Then uses that learned model as the forward model
+    # inside the same random-shooting planner.  planner_wm_horizon may be
+    # shorter than planner_horizon because learned-model errors compound.
     if args.agent == "planner_wm":
         print(f"Training World Model ({args.wm_epochs} epochs)...")
         mc = ModelConfig()
@@ -121,7 +181,25 @@ def build_agent(args, cfg, obs_dim):
 
 
 def record_episode(sim, agent, expert, max_steps):
-    """Record one episode with detailed per-step data."""
+    """Record one episode with detailed per-step data.
+
+    In addition to the basic simulation state, each frame captures debug data
+    that the viewer uses for analysis overlays:
+
+      expert_action - what the expert would have done at the same observation,
+                      letting the viewer highlight where the agent diverges.
+      lane_gaps     - per-lane dict mapping lane index to {ahead, behind}
+                      distances (metres) to the nearest NPC.  None means no
+                      NPC in that direction.  Useful for understanding why the
+                      expert chose a particular lane change.
+      disagree      - boolean shorthand: True when agent and expert chose
+                      different discrete actions (compared via to_index()).
+      gap_ahead / gap_behind - ego-lane gaps, kept for backward compat.
+      cumulative_reward - running total so the viewer can plot reward curves.
+
+    Returns (frames, info) where info is the final step's info dict from the
+    simulator (used to extract collision status).
+    """
     obs = sim.reset()
     agent.reset()
     frames = []
@@ -129,7 +207,8 @@ def record_episode(sim, agent, expert, max_steps):
     step = 0
     cumulative_reward = 0.0
 
-    # Initial frame
+    # Initial frame (step 0): no actions have been taken yet, so action and
+    # expert_action are both None and reward/cumulative_reward are zero.
     ego, npcs = sim.get_all_vehicle_states()
     frames.append({
         "step": 0,
@@ -144,6 +223,8 @@ def record_episode(sim, agent, expert, max_steps):
     })
 
     while not done and step < max_steps:
+        # Query both the agent under test and the expert on the *same*
+        # observation so their actions are directly comparable.
         action = agent.act(obs)
         expert_action = expert.act(obs)
         obs, reward, done, info = sim.step(action)
@@ -153,7 +234,9 @@ def record_episode(sim, agent, expert, max_steps):
         ego, npcs = sim.get_all_vehicle_states()
         num_lanes = sim.road.num_lanes
 
-        # Compute gaps per lane: ahead and behind
+        # Compute the distance to the nearest NPC ahead and behind the ego
+        # vehicle in every lane.  This gives the viewer a full picture of
+        # available gaps, not just the ego's current lane.
         lane_gaps = {}
         for lane in range(num_lanes):
             ahead_in_lane = [n for n in npcs if n.lane == lane and n.x > ego.x]
@@ -163,7 +246,8 @@ def record_episode(sim, agent, expert, max_steps):
                 "behind": round(min(ego.x - n.x for n in behind_in_lane), 1) if behind_in_lane else None,
             }
 
-        # Current lane gaps for backward compatibility
+        # Current-lane gaps extracted separately for backward compatibility
+        # with older viewer versions that don't read lane_gaps.
         gap_ahead = lane_gaps[ego.lane]["ahead"]
         gap_behind = lane_gaps[ego.lane]["behind"]
 
@@ -181,6 +265,8 @@ def record_episode(sim, agent, expert, max_steps):
             "gap_ahead": gap_ahead,
             "gap_behind": gap_behind,
             "lane_gaps": lane_gaps,
+            # Flag steps where the agent and expert disagree, so the viewer
+            # can highlight these frames (e.g. with a red border).
             "disagree": action.to_index() != expert_action.to_index(),
         })
 
@@ -188,6 +274,10 @@ def record_episode(sim, agent, expert, max_steps):
 
 
 def main():
+    # --- CLI arguments ---
+    # Two seed arguments: --seed controls the episode being recorded, while
+    # --train-seed controls the expert data collection and model training.
+    # Keeping them separate lets you train once and evaluate on many episodes.
     parser = argparse.ArgumentParser(description="Record debug episode")
     parser.add_argument("--agent", type=str, default="expert",
                         choices=["expert", "bc", "planner_true", "planner_wm", "rl"])
@@ -207,9 +297,12 @@ def main():
     args = parser.parse_args()
 
     cfg = make_config(args)
+    # Observation dimension: 3 ego features (x, lane, speed) plus 4 features
+    # per neighbour (dx, lane, speed, id) for the k nearest NPCs.
     obs_dim = 3 + cfg.obs.k_neighbors * 4
 
-    # Seed all RNGs for reproducibility
+    # Seed all RNGs (Python, NumPy, PyTorch CPU+CUDA) for full reproducibility
+    # of training and evaluation.
     import random
     random.seed(args.train_seed)
     np.random.seed(args.train_seed)
@@ -217,14 +310,18 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.train_seed)
 
-    # Build agent
+    # Build the agent (may involve training) and a separate expert instance
+    # that will be queried in parallel during recording for comparison.
     agent, agent_info = build_agent(args, cfg, obs_dim)
     expert = ExpertAgent(obs_config=cfg.obs, num_lanes=cfg.road.num_lanes)
 
-    # Record episode
+    # --- Record the episode ---
     print(f"\nRecording episode: agent={args.agent} seed={args.seed} "
           f"lanes={args.num_lanes} npcs={args.num_npcs}")
 
+    # The planner_true agent internally mutates its own simulator (for
+    # look-ahead rollouts), so we must use that same sim for recording.
+    # All other agents get a fresh simulator seeded for the evaluation episode.
     if args.agent == "planner_true":
         sim = agent.sim  # planner needs its own sim
     else:
@@ -232,7 +329,13 @@ def main():
 
     frames, info = record_episode(sim, agent, expert, args.max_steps)
 
-    # Build output
+    # --- Assemble the output JSON ---
+    # Top-level structure consumed by debug_viewer.html:
+    #   version    : schema version (2) so the viewer can handle format changes
+    #   config     : environment and episode parameters for display/filtering
+    #   agent_info : training metadata (type, losses, reward curves, etc.)
+    #   summary    : quick stats (steps, reward, collision, disagree count)
+    #   frames     : the full per-step data array (see record_episode docstring)
     output = {
         "version": 2,
         "config": {
@@ -246,15 +349,17 @@ def main():
         },
         "agent_info": agent_info,
         "summary": {
-            "total_steps": len(frames) - 1,
+            "total_steps": len(frames) - 1,  # exclude the initial frame
             "total_reward": frames[-1]["cumulative_reward"] if frames else 0,
             "collision": info.get("collision", False),
             "final_speed": frames[-1]["ego"]["speed"] if frames else 0,
+            # Count of frames where the agent chose differently from the expert
             "disagree_count": sum(1 for f in frames if f.get("disagree", False)),
         },
         "frames": frames,
     }
 
+    # Write with indent=2 for human readability (files are typically < 1 MB)
     with open(args.output, "w") as f:
         json.dump(output, f, indent=2)
 

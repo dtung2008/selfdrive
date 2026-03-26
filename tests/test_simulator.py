@@ -102,7 +102,7 @@ class TestSimulator:
         # Force traffic manager to have this NPC
         self.sim.traffic.npcs = {
             999: (self.sim.npc_states[0],
-                  self.sim.traffic._assign_behavior())
+                  self.sim.traffic._assign_behavior(5.0))
         }
         action = Action(LongitudinalAction.ACCELERATE, LateralAction.KEEP)
         _, reward, done, info = self.sim.step(action)

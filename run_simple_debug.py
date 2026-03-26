@@ -2,11 +2,25 @@
 """
 Simplified single-lane comparison for debugging.
 
+Purpose:
+  Isolate longitudinal (speed) control for debugging by removing lateral
+  (lane-change) decisions entirely.  If any agent collides in this
+  trivially simple scenario, the bug is in the core pipeline — not in
+  the complexity of multi-lane traffic.
+
 Setup:
   - 1 lane, no lane changes allowed
   - 2 NPCs: one ahead (constant speed), one behind (constant speed)
   - Ego controls only longitudinal: brake / keep / accelerate
   - All agents should achieve 0% collision rate
+
+Pipeline executed in main():
+  1. Create an expert (rule-based) agent.
+  2. Collect demonstration trajectories with the expert.
+  3. Train a Behavior Cloning (BC) policy on those demonstrations.
+  4. Train an attention-based World Model on (obs, act, next_obs) tuples.
+  5. Fine-tune the BC policy with REINFORCE (warm-started RL).
+  6. Build planners (true-model and learned-WM) and evaluate all agents.
 
 This isolates the longitudinal control problem and removes all
 stochasticity from the environment.
@@ -31,22 +45,36 @@ from training.evaluator import Evaluator
 
 
 def make_simple_config():
-    """Single lane, 2 IDM NPCs."""
+    """Single lane, 2 IDM NPCs — the simplest possible driving scenario."""
     cfg = Config()
+
+    # -- Road: single lane eliminates all lateral decision-making.
     cfg.road.num_lanes = 1
+
+    # -- Traffic: only 2 NPCs so the ego always has exactly one car
+    #    ahead and one behind (at most).
     cfg.traffic.num_npcs = 2
-    cfg.traffic.spawn_range = 80.0
-    cfg.traffic.despawn_distance = 500.0
-    cfg.traffic.min_spawn_gap = 20.0
-    # All NPCs use IDM (choice 0 and 1 both map to IDM now)
+    cfg.traffic.spawn_range = 80.0       # NPCs spawn within 80 m of ego
+    cfg.traffic.despawn_distance = 500.0  # recycle far-away NPCs
+    cfg.traffic.min_spawn_gap = 20.0      # avoid overlapping spawns
+
+    # behavior_mix = [aggressive, IDM, passive].  Setting [0, 1, 0] means
+    # 100 % IDM (constant-speed car-following).  No aggressive or passive
+    # drivers, so NPC behavior is fully deterministic.
     cfg.traffic.behavior_mix = [0.0, 1.0, 0.0]
-    cfg.traffic.personality_std = 0.0
-    cfg.sim.episode_steps = 200
-    cfg.sim.collision_reward = -50.0
-    cfg.sim.speed_reward_scale = 1.0
-    cfg.sim.lane_change_penalty = 0.0
-    cfg.sim.hard_brake_penalty = -0.5
+    cfg.traffic.personality_std = 0.0     # zero randomness in IDM params
+
+    # -- Simulation / reward tuning for this simple scenario.
+    cfg.sim.episode_steps = 200           # short episodes are enough
+    cfg.sim.collision_reward = -50.0      # heavy penalty so RL avoids crashes
+    cfg.sim.speed_reward_scale = 1.0      # reward for maintaining target speed
+    cfg.sim.lane_change_penalty = 0.0     # irrelevant (single lane)
+    cfg.sim.hard_brake_penalty = -0.5     # small penalty to discourage panic stops
+
+    # -- Observation: include up to 4 nearest neighbors.  Each neighbor
+    #    contributes 4 features (rel_x, rel_y, rel_speed, lane_offset).
     cfg.obs.k_neighbors = 4
+
     return cfg
 
 
@@ -54,9 +82,9 @@ def make_simple_config():
 def main():
     parser = argparse.ArgumentParser(description="Simplified 1-lane debug comparison")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--collect-episodes", type=int, default=30)
-    parser.add_argument("--bc-epochs", type=int, default=50)
-    parser.add_argument("--wm-epochs", type=int, default=80)
+    parser.add_argument("--collect-episodes", type=int, default=50)
+    parser.add_argument("--bc-epochs", type=int, default=200)
+    parser.add_argument("--wm-epochs", type=int, default=20)
     parser.add_argument("--rl-episodes", type=int, default=300)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--planner-horizon", type=int, default=30)
@@ -64,6 +92,9 @@ def main():
     args = parser.parse_args()
 
     cfg = make_simple_config()
+
+    # obs_dim = 3 ego features (speed, lane, x) + k_neighbors * 4 neighbor
+    # features (rel_x, rel_y, rel_speed, lane_offset) = 3 + 4*4 = 19.
     obs_dim = 3 + cfg.obs.k_neighbors * 4  # 19
 
     mc = ModelConfig()
@@ -79,6 +110,8 @@ def main():
     print("=" * 60)
 
     # ---- 1. Expert ----
+    # The expert is a hand-coded rule-based agent (IDM + safety checks).
+    # It serves as the upper-bound baseline and the source of BC training data.
     print("\n[1/5] Expert Agent")
     expert = ExpertAgent(
         obs_config=cfg.obs,
@@ -88,6 +121,9 @@ def main():
     )
 
     # ---- 2. Collect expert data ----
+    # Roll out the expert in the simulator and store (obs, act, reward,
+    # next_obs, done) tuples for supervised learning (BC) and world-model
+    # training.
     print(f"\n[2/5] Collecting {args.collect_episodes} expert episodes...")
     sim_collect = Simulator(cfg, seed=args.seed)
     collector = DataCollector(sim_collect, expert)
@@ -97,7 +133,10 @@ def main():
     expert_rewards = [t.total_reward for t in trajectories]
     print(f"  {len(obs_data)} transitions, avg reward: {np.mean(expert_rewards):.1f}")
 
-    # Analyze action distribution
+    # Analyze action distribution — a healthy expert dataset for single-lane
+    # driving should be dominated by KEEP (cruise), with some ACCELERATE and
+    # BRAKE for car-following.  A skewed distribution here hints at a bug in
+    # the expert or the simulator.
     unique, counts = np.unique(act_data, return_counts=True)
     print("  Action distribution:")
     from utils.types import Action
@@ -108,18 +147,23 @@ def main():
               f"({u}): {c:>5} ({pct:.1f}%)")
 
     # ---- 3. Train BC ----
+    # Supervised learning: the policy network learns to imitate the expert's
+    # action distribution.  BCTrainer.train() returns (losses, ObsNormalizer)
+    # — the normalizer is needed by BCAgent and later by the RL trainer so
+    # that observations are on the same scale the policy was trained on.
     print(f"\n[3/5] Training Behavior Cloning ({args.bc_epochs} epochs)...")
     bc_policy = PolicyNetwork(obs_dim, hidden_dim=64, num_layers=2)
     bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
-    bc_losses = bc_trainer.train(obs_data, act_data,
-                                  num_epochs=args.bc_epochs, verbose=True)
-    bc_agent = BCAgent(bc_policy, deterministic=True)
+    bc_losses, bc_normalizer = bc_trainer.train(obs_data, act_data,
+                                                num_epochs=args.bc_epochs, verbose=True)
+    bc_agent = BCAgent(bc_policy, deterministic=True, normalizer=bc_normalizer)
 
-    # Check what BC predicts
+    # Check what BC predicts — feed normalized observations through the
+    # policy to verify the learned action distribution looks reasonable.
     print("  BC action predictions on training data sample:")
     bc_policy.eval()
     with torch.no_grad():
-        sample_obs = torch.FloatTensor(obs_data[:100])
+        sample_obs = torch.FloatTensor(bc_normalizer.normalize(obs_data[:100]))
         preds = bc_policy(sample_obs).argmax(dim=-1).numpy()
     unique_p, counts_p = np.unique(preds, return_counts=True)
     for u, c in zip(unique_p, counts_p):
@@ -128,6 +172,8 @@ def main():
               f"({u}): {c:>3}")
 
     # ---- 4. Train World Model ----
+    # The world model learns next_obs = f(obs, action) so the planner can
+    # do "imagination" rollouts without querying the real simulator.
     print(f"\n[4/5] Training World Model ({args.wm_epochs} epochs)...")
     world_model = AttentionWorldModel(
         embed_dim=mc.wm_embed_dim, num_heads=mc.wm_num_heads,
@@ -137,7 +183,9 @@ def main():
     wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                   num_epochs=args.wm_epochs, verbose=True)
 
-    # Validate WM: single-step prediction error in real space
+    # Validate WM: single-step prediction error in real (un-normalized) space.
+    # This sanity-checks that the WM generalizes on training data before we
+    # trust it for multi-step planning rollouts.
     print("  WM single-step prediction test (first 100 samples):")
     world_model.eval()
     with torch.no_grad():
@@ -156,7 +204,9 @@ def main():
         if obs_dim > 3:
             print(f"    neighbor  MAE: {errors[:, 3:].mean():.3f}")
 
-    # Validate WM: multi-step rollout vs real simulator
+    # Validate WM: multi-step rollout vs real simulator.
+    # We apply the neutral KEEP action for 30 steps in both the real sim and
+    # the WM and compare how quickly prediction error compounds.
     print("  WM multi-step rollout test (30 steps, KEEP action):")
     sim_val = Simulator(cfg, seed=args.seed + 50)
     obs_val = sim_val.reset()
@@ -188,18 +238,27 @@ def main():
                 break
 
     # ---- 5. Train RL (warm-started from BC policy) ----
+    # Warm-starting from BC gives REINFORCE a much better initial policy than
+    # random, so it mainly fine-tunes rather than learning from scratch.
+    # We use a low learning rate (1e-4) and low entropy coefficient (0.005)
+    # to avoid destroying the useful structure already learned by BC.
     print(f"\n[5/5] Training RL ({args.rl_episodes} episodes, warm-start from BC)...")
     # Copy BC policy weights as starting point
     import copy
     rl_policy = copy.deepcopy(bc_policy)
     sim_rl = Simulator(cfg, seed=args.seed + 1)
-    # Lower lr to not destroy BC knowledge, lower entropy since policy is already good
     rl_trainer = RLTrainer(rl_policy, sim_rl, lr=1e-4, gamma=0.99,
                             entropy_coef=0.005)
+    # The RL trainer must normalize observations the same way BC did,
+    # otherwise the copied policy weights will see a different input
+    # distribution and perform randomly.
+    rl_trainer.obs_normalizer = bc_normalizer
     rl_rewards = rl_trainer.train(num_episodes=args.rl_episodes, verbose=True)
-    rl_agent = BCAgent(rl_policy, deterministic=True)
+    rl_agent = BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer)
 
     # ---- Build planners ----
+    # Two planners: one uses the real simulator (oracle), the other uses the
+    # learned world model.  Comparing them reveals WM prediction quality.
     print("\nBuilding planners...")
     sim_planner = Simulator(cfg, seed=args.seed + 2)
     planner_true = PlannerTrueModel(sim_planner, mc, seed=args.seed)
@@ -209,6 +268,9 @@ def main():
         normalizer=wm_trainer.normalizer, seed=args.seed)
 
     # ---- Evaluate ----
+    # Run every agent for eval_episodes and report collision rate, avg reward,
+    # and avg speed.  In this single-lane setup ALL agents should achieve 0%
+    # collision rate; any failure points to a pipeline bug.
     print(f"\n{'='*60}")
     print(f"Evaluating all agents ({args.eval_episodes} episodes each)...")
     print(f"{'='*60}")

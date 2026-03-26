@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 """Compare hybrid WM rollout (exact ego + WM NPC) against true simulator.
 
-Shows gap accuracy which is what matters for collision avoidance.
+The "hybrid rollout" strategy uses exact analytical kinematics for the ego
+vehicle (acceleration/deceleration physics are known perfectly) while relying
+on the world model only to predict NPC *delta* movements.  This isolates the
+WM's NPC-prediction error from any ego-prediction error.
+
+At each step:
+  1. Ego state is updated with exact kinematic equations (no WM involved).
+  2. The WM receives a relative-coordinate observation and predicts the next
+     relative observation.  The *change* in each NPC's relative position/speed
+     is extracted and converted back to absolute coordinates.
+  3. The resulting hybrid gap (ego-to-NPC distance) is compared against the
+     true simulator's gap to quantify how much the WM's NPC predictions drift.
+
+The script deliberately seeks out a "tight-gap" seed (initial gap 25-40 m)
+because small gap errors matter most when they can cause false-positive or
+false-negative collision predictions during planning.
 """
 import sys
 sys.path.insert(0, ".")
@@ -40,7 +55,12 @@ def main():
     normalizer = wm_trainer.normalizer
     print("WM trained.\n")
 
-    # Find tight-gap seed
+    # --- Tight-gap seed scanning ---
+    # We scan 200 seeds looking for one where the nearest NPC ahead starts
+    # 25-40 m in front of ego.  This "tight gap" range is the danger zone:
+    # close enough that even small WM prediction errors could flip a
+    # collision/no-collision decision in the planner.  We pick the seed with
+    # the smallest gap in that band for the most demanding test.
     print("Scanning for tight-gap scenario...")
     best_seed, best_gap = 99, 999
     for s in range(200):
@@ -62,22 +82,35 @@ def main():
         print(f"  NPC {n.vehicle_id}: x={n.x:.1f} speed={n.speed:.1f}")
     print()
 
-    # Init hybrid state: exact ego + absolute NPC positions
+    # --- Initialize hybrid state ---
+    # We maintain absolute NPC positions and speeds, reconstructed from the
+    # simulator's relative observation (obs gives rel_x and rel_speed for each
+    # neighbor slot).  On each step we will update these using WM deltas.
     ego_speed = obs_true[0]
     ego_x = obs_true[2]
-    npc_abs_x = np.zeros(k)
-    npc_abs_speed = np.zeros(k)
-    npc_exists = np.zeros(k)
+    npc_abs_x = np.zeros(k)       # absolute longitudinal position per slot
+    npc_abs_speed = np.zeros(k)    # absolute speed per slot
+    npc_exists = np.zeros(k)       # 1.0 if this neighbor slot is occupied
     for ni in range(k):
         base = 3 + ni * 4
-        npc_abs_x[ni] = ego_x + obs_true[base]
-        npc_abs_speed[ni] = ego_speed + obs_true[base + 2]
+        # Convert from relative (ego-centric) to absolute coordinates
+        npc_abs_x[ni] = ego_x + obs_true[base]           # rel_x -> abs_x
+        npc_abs_speed[ni] = ego_speed + obs_true[base + 2]  # rel_speed -> abs
         npc_exists[ni] = obs_true[base + 3]
 
     wm.eval()
     dt = cfg.sim.dt
-    horizon = 40
+    horizon = 40  # run 40 steps to see how errors accumulate over time
 
+    # Output table columns:
+    #   Step     -- simulation timestep
+    #   Action   -- expert's longitudinal action (ACC/KP/BRK)
+    #   True spd -- ego speed from the real simulator
+    #   Hyb spd  -- ego speed from exact kinematics (should match True perfectly)
+    #   err      -- absolute speed error (should be ~0 since ego is analytical)
+    #   True gap -- distance to nearest NPC ahead in the real simulator
+    #   Hyb gap  -- same distance computed from WM-predicted NPC positions
+    #   err      -- absolute gap error (this is the key metric; grows over time)
     print(f"{'Step':>4} | {'Action':>10} | "
           f"{'True spd':>8} {'Hyb spd':>8} {'err':>6} | "
           f"{'True gap':>8} {'Hyb gap':>8} {'err':>8}")
@@ -125,7 +158,16 @@ def main():
             pred_norm = wm(obs_t, act_t)
             pred_real = normalizer.inverse_transform(pred_norm.cpu().numpy())[0]
 
-            # Extract NPC deltas
+            # --- Extract NPC deltas from WM prediction ---
+            # The WM predicts the *next* relative observation.  To recover each
+            # NPC's absolute movement we compute:
+            #   delta_rel_x    = pred_rel_x - cur_rel_x
+            #   delta_abs_x    = delta_rel_x + ego_delta_x
+            # The ego_delta_x correction is needed because the WM's output is
+            # ego-relative: if ego moved forward 2 m and the NPC didn't move,
+            # the predicted rel_x would decrease by 2 m, so we must add back
+            # the ego displacement to get the NPC's true absolute movement.
+            # The same logic applies to speed.
             ego_delta_x = ego_x - prev_x
             ego_delta_speed = ego_speed - prev_speed
             for ni in range(k):
@@ -140,6 +182,7 @@ def main():
                 delta_rel_x = pred_rel_x - cur_rel_x
                 delta_rel_speed = pred_rel_speed - cur_rel_speed
 
+                # Convert relative delta to absolute delta and accumulate
                 npc_abs_x[ni] += delta_rel_x + ego_delta_x
                 npc_abs_speed[ni] += delta_rel_speed + ego_delta_speed
 

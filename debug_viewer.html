@@ -3,6 +3,48 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  Self-Driving Debug Viewer
+  =========================
+  Loads a JSON episode file produced by record_debug.py (or record_episodes.py)
+  and provides an interactive step-by-step visualization of the ego vehicle and
+  NPCs on a top-down road canvas.
+
+  Expected JSON structure:
+    {
+      "config":     { agent, seed, num_lanes, num_npcs, ... },
+      "agent_info": { model parameters, horizon, etc. },
+      "summary":    { total_steps, total_reward, collision, disagree_count },
+      "frames": [
+        {
+          "step": int,
+          "ego":  { x, speed, lane },
+          "npcs": [ { id, x, speed, lane }, ... ],
+          "action":        { lon: -1|0|1, lat: -1|0|1 },
+          "expert_action": { lon, lat },  // what the expert would have done
+          "reward": float,
+          "cumulative_reward": float,
+          "gap_ahead": float | null,
+          "gap_behind": float | null,
+          "lane_gaps": { "0": {ahead, behind}, "1": {ahead, behind}, ... },
+          "collision": bool,
+          "disagree": bool   // true when agent action != expert action
+        }, ...
+      ]
+    }
+
+  Layout:
+    - Header bar: file loader and episode title
+    - Info bar: high-level episode metadata (agent, seed, lanes, result)
+    - Road canvas: top-down view centered on ego, NPCs drawn as blue rectangles
+    - Controls: play/pause, step forward/back, scrubber, speed slider,
+      jump-to-disagree and jump-to-crash buttons
+    - Two side-by-side panels:
+        Left:  step-level metrics (speed, lane, action, gaps, reward) plus
+               "Dump for Claude" buttons that format step data as text for
+               pasting into an LLM conversation
+        Right: vehicle list sorted by position with proximity highlighting
+-->
 <title>Self-Driving Debug Viewer</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -120,17 +162,24 @@
   </div>
 </div>
 <script>
-let data = null;
-let curStep = 0;
-let playing = false;
-let playTimer = null;
+// ---- Global state ----
+let data = null;       // Parsed JSON episode (set on file load)
+let curStep = 0;       // Currently displayed frame index
+let playing = false;   // Whether auto-play is active
+let playTimer = null;  // setInterval handle for auto-play
 
 const canvas = document.getElementById('road');
 const ctx = canvas.getContext('2d');
+
+// Maps for converting action indices to human-readable strings.
+// lon: -1=brake, 0=keep, 1=accelerate; lat: -1=left, 0=straight, 1=right
 const LON = {"-1":"BRK","0":"KP","1":"ACC"};
 const LAT = {"-1":"L","0":"-","1":"R"};
 function actionStr(a) { return a ? LON[a.lon]+"/"+LAT[a.lat] : "-"; }
 
+// ---- File loading ----
+// Reads the JSON file produced by record_debug.py, parses it, initializes
+// the scrubber range to match the number of frames, and renders step 0.
 document.getElementById('fileInput').addEventListener('change', e => {
   const file = e.target.files[0];
   if (!file) return;
@@ -207,6 +256,11 @@ function render() {
   drawVehicles(f, cfg);
 }
 
+// ---- Road canvas rendering ----
+// Draws a top-down view of the road centered on ego.  The visible window
+// spans from (ego.x - 100) to (ego.x + 150) meters.  NPCs are blue
+// rectangles with speed labels; ego is green (or orange on disagree, red
+// on collision).  Each vehicle shows its speed in m/s inside the rectangle.
 function drawRoad(f, cfg) {
   const W = canvas.width, H = canvas.height;
   const numLanes = cfg.num_lanes;
@@ -284,6 +338,10 @@ function drawRoad(f, cfg) {
   }
 }
 
+// ---- Step details panel (left) ----
+// Shows per-step metrics from the frame JSON: ego state, chosen action vs
+// expert action, gap distances, and per-lane gap breakdown.  Gap values
+// are color-coded: green (safe), orange (< 15 m), red (< 8 m).
 function drawDetails(f) {
   const el = document.getElementById('stepDetails');
   const da = f.disagree ? ' <span class="disagree">DISAGREE</span>' : '';
@@ -321,6 +379,10 @@ function drawDetails(f) {
   `;
 }
 
+// ---- Vehicle list panel (right) ----
+// Renders a sorted table of all NPCs with their lane, speed, and relative
+// position to ego.  Vehicles in the same lane within 20 m are highlighted
+// in orange to draw attention to potential collision threats.
 function drawVehicles(f, cfg) {
   const el = document.getElementById('vehicleDetails');
   let html = `<div class="npc-row" style="color:#666;border:none;">
@@ -351,6 +413,13 @@ function fmtLaneGaps(f) {
   return parts.join(' ');
 }
 
+// ---- Dump functions ----
+// These format episode data as plain text and copy it to the clipboard,
+// designed for pasting into an LLM conversation for analysis.
+//   dumpRange()       -- last 20 steps up to current step
+//   dumpAroundCrash() -- 30 steps before the collision frame + NPC positions
+//   dumpFull()        -- config, summary, and all disagree steps
+//   dumpAllSteps()    -- every frame in a table with lane-change/disagree markers
 function dumpRange() {
   if (!data) return;
   const start = Math.max(0, curStep - 19);

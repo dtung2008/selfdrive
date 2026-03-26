@@ -1,126 +1,280 @@
 # Self-Driving Simulator
 
-A modular simulator for learning and comparing self-driving control strategies on a multi-lane highway.
+A modular simulator for learning and comparing self-driving control strategies on a multi-lane highway. The project implements a complete pipeline from environment simulation through expert data collection, model training, and multi-agent evaluation.
+
+## Overview
+
+This project provides:
+
+- A **multi-lane highway simulator** with realistic traffic (IDM car-following, MOBIL lane-changing)
+- Five **driving agents** spanning rule-based, supervised learning, model-predictive control, and reinforcement learning
+- An **attention-based world model** (Transformer) that learns to predict traffic dynamics
+- A **training pipeline** for behavior cloning, world model learning, and policy gradient RL
+- An **evaluation harness** for side-by-side agent comparison with metrics like collision rate, average speed, and episode completion
 
 ## Agents Compared
 
 | Agent | Type | Description |
 |---|---|---|
-| **Expert** | Rule-based | IDM-like speed control + safe lane changes. Generates training data. |
-| **Behavior Cloning** | Supervised | MLP policy trained to imitate the expert. |
-| **Planner (true model)** | MPC | Random-shooting MPC using the real simulator for rollouts. |
-| **Planner (learned WM)** | MPC | Same MPC but rollouts use an attention-based world model. |
-| **RL (REINFORCE)** | Policy gradient | MLP policy trained via REINFORCE with baseline. |
+| **Expert** | Rule-based | IDM-like longitudinal control with safe lane-change decisions. Used to generate demonstration data for supervised learning. |
+| **Behavior Cloning (BC)** | Supervised | MLP policy trained to imitate the expert via cross-entropy loss with inverse-frequency class weighting for rare actions. |
+| **Planner (true model)** | MPC | Random-shooting model-predictive control using the real simulator's `clone_state`/`restore_state` for exact rollouts. Evaluates 9 maneuver templates over a configurable horizon. |
+| **Planner (learned WM)** | MPC | Same MPC framework but replaces the simulator with a learned attention-based world model. Runs rollouts entirely in PyTorch for speed. |
+| **RL (REINFORCE)** | Policy gradient | MLP policy trained via REINFORCE with running baseline, advantage whitening, entropy bonus, and gradient clipping. |
 
 ## Traffic Models
 
-NPCs use realistic car-following and lane-change models:
+NPCs use realistic car-following and lane-change models from the traffic simulation literature:
 
-- **Constant Speed** — baseline vehicles maintaining fixed speed
-- **IDM (Intelligent Driver Model)** — physics-based car-following with configurable desired speed, time headway, and comfort braking
-- **MOBIL** — incentive-based lane changes on top of IDM, checking safety constraints
-- **Personality Variants** — randomized IDM/MOBIL parameters create aggressive/timid driver mixes
+- **Constant Speed** -- Baseline vehicles maintaining a fixed target speed with proportional control.
+- **IDM (Intelligent Driver Model)** -- Physics-based car-following (Treiber et al., 2000) with configurable desired speed `v0`, time headway `T`, minimum gap `s0`, and comfort acceleration/braking `a`/`b`. Produces smooth, collision-free longitudinal behavior.
+- **MOBIL (Minimizing Overall Braking Induced by Lane changes)** -- Incentive-based lane-change model (Kesting et al., 2007) layered on top of IDM. Checks a safety criterion (follower deceleration < threshold) and an incentive criterion (net acceleration gain > politeness-weighted cost + threshold).
+- **Personality Variants** -- Gaussian noise applied to IDM/MOBIL parameters creates a mix of aggressive and timid drivers, improving training distribution diversity.
+
+## Architecture
+
+### Action Space
+
+9 discrete actions arranged as a 3x3 grid:
+
+```
+                  Lateral
+              LEFT  KEEP  RIGHT
+           +------+------+------+
+DECELERATE |  0   |  1   |  2   |
+Lon  KEEP  |  3   |  4   |  5   |
+ACCELERATE |  6   |  7   |  8   |
+           +------+------+------+
+
+Index formula: (longitudinal + 1) * 3 + (lateral + 1)
+```
+
+### Observation Space
+
+Fixed-size vector with ego state followed by K nearest neighbors (default K=6):
+
+```
+[ego_speed, ego_lane, ego_x,          # 3 values: ego state
+ rel_x_1, rel_lane_1, rel_speed_1, exists_1,   # 4 values per neighbor
+ rel_x_2, rel_lane_2, rel_speed_2, exists_2,   # sorted by distance
+ ...                                             # zero-padded if < K
+ rel_x_K, rel_lane_K, rel_speed_K, exists_K]   # total: 3 + 4*K = 27
+```
+
+### Attention World Model
+
+The world model uses a Transformer encoder to predict next-state deltas:
+
+1. **Per-vehicle embedding** -- Each vehicle's features are projected to `embed_dim` via separate MLPs for ego and neighbors
+2. **Action injection** -- One-hot ego action is concatenated before embedding
+3. **Type embedding** -- Learned tokens distinguish ego (position 0) from NPC vehicles
+4. **Transformer encoder** -- Multi-head self-attention captures inter-vehicle interactions (e.g., braking cascades). Attention masking handles variable neighbor counts
+5. **Residual prediction** -- Output heads predict state *deltas* rather than absolute values, making learning easier when consecutive states are similar
 
 ## Project Structure
 
 ```
 selfdrive/
-├── environment/
-│   ├── road.py               # Road geometry (N lanes)
-│   ├── vehicle.py            # Kinematic vehicle dynamics
-│   ├── traffic_behaviors.py  # Constant / IDM / MOBIL behaviours
-│   ├── traffic_manager.py    # NPC spawn, despawn, stepping
-│   ├── observation.py        # Fixed-size observation builder
-│   └── simulator.py          # Gym-like step/reset interface
-├── agents/
-│   ├── base.py               # Abstract Agent interface
-│   ├── expert.py             # Rule-based expert driver
-│   ├── bc_agent.py           # Behavior cloning agent
-│   ├── planner_true.py       # MPC with true simulator
-│   └── planner_learned.py    # MPC with learned world model
-├── models/
-│   ├── policy_net.py         # MLP policy network
-│   └── world_model.py        # Attention-based world model
-├── training/
-│   ├── data_collector.py     # Trajectory collection
-│   ├── bc_trainer.py         # Supervised BC training
-│   ├── world_model_trainer.py# World model training
-│   ├── rl_trainer.py         # REINFORCE trainer
-│   └── evaluator.py          # Multi-agent evaluation & comparison
-├── utils/
-│   ├── types.py              # Core dataclasses (Action, VehicleState, etc.)
-│   └── config.py             # All hyperparameters
-├── tests/
-│   ├── test_types_config.py
-│   ├── test_road_vehicle.py
-│   ├── test_traffic_behaviors.py
-│   ├── test_traffic_manager.py
-│   ├── test_observation.py
-│   ├── test_simulator.py
-│   ├── test_expert.py
-│   ├── test_models.py
-│   ├── test_training.py
-│   └── test_planners_eval.py
-├── run_comparison.py         # Full pipeline: train + compare all agents
-└── requirements.txt
+├── environment/                     # Simulation engine
+│   ├── road.py                      # Road geometry: N lanes, lane widths, bounds checking
+│   ├── vehicle.py                   # First-order kinematic dynamics (Euler integration)
+│   ├── traffic_behaviors.py         # NPC behaviors: Constant Speed, IDM, MOBIL
+│   ├── traffic_manager.py           # NPC lifecycle: spawn, step, despawn, respawn
+│   ├── observation.py               # Ego-centric fixed-size observation builder
+│   └── simulator.py                 # Gym-like step/reset with reward computation
+├── agents/                          # Driving agents
+│   ├── base.py                      # Abstract Agent interface: act(obs) -> Action
+│   ├── expert.py                    # Rule-based expert with IDM-like logic
+│   ├── bc_agent.py                  # Behavior cloning agent with safety override
+│   ├── planner_true.py              # MPC planner using true simulator rollouts
+│   └── planner_learned.py           # MPC planner using learned world model
+├── models/                          # Neural network architectures
+│   ├── policy_net.py                # MLP policy: obs -> action logits (9 classes)
+│   └── world_model.py              # Transformer world model: (obs, action) -> next_obs
+├── training/                        # Training loops and data collection
+│   ├── data_collector.py            # Trajectory collection via agent-environment interaction
+│   ├── bc_trainer.py                # Behavior cloning: cross-entropy + class weighting
+│   ├── world_model_trainer.py       # World model: MSE on normalized observation deltas
+│   ├── rl_trainer.py                # REINFORCE with baseline, entropy, grad clipping
+│   └── evaluator.py                 # Multi-agent evaluation with statistical metrics
+├── utils/                           # Shared types and configuration
+│   ├── types.py                     # Core dataclasses: Action, VehicleState, Observation,
+│   │                                #   Transition, Trajectory
+│   └── config.py                    # All hyperparameters: road, vehicle, traffic, sim,
+│                                    #   observation, model configs
+├── tests/                           # 103 unit tests covering all modules
+│   ├── test_types_config.py         # Action encoding, VehicleState, Observation, Config
+│   ├── test_road_vehicle.py         # Road geometry, VehicleDynamics step functions
+│   ├── test_traffic_behaviors.py    # IDM/MOBIL/ConstantSpeed + helper functions
+│   ├── test_traffic_manager.py      # NPC spawn/despawn, gap enforcement, multi-lane
+│   ├── test_observation.py          # Observation shape, sorting, padding, truncation
+│   ├── test_simulator.py            # Step/reset, collision, reward, clone/restore
+│   ├── test_expert.py               # Expert decisions on crafted observations
+│   ├── test_models.py               # PolicyNetwork + AttentionWorldModel shapes/gradients
+│   ├── test_training.py             # DataCollector, BCTrainer, WorldModelTrainer
+│   └── test_planners_eval.py        # PlannerTrue, PlannerLearned, Evaluator
+├── run_comparison.py                # Full pipeline: collect data, train all agents, compare
+├── run_simple_debug.py              # Simplified 1-lane comparison for isolating longitudinal control
+├── record_episodes.py               # Record episode replays as JSON for browser visualization
+├── record_debug.py                  # Enhanced debug recording with expert comparison per step
+├── trace_bc_collision.py            # Step-by-step BC collision diagnosis (BC vs Expert)
+├── test_wm_horizon.py              # WM planner error-compounding test across horizons
+├── verify_wm_rollout.py            # Hybrid WM rollout accuracy vs true simulator
+├── debug_planner_decision.py        # Planner reward breakdown at stuck/slow steps
+├── debug_viewer.html                # Browser-based episode visualization (loads JSON replays)
+├── requirements.txt                 # Dependencies: numpy, torch, pytest
+└── .gitignore
 ```
 
 ## Setup
+
+### Prerequisites
+
+- Python 3.9+
+- pip
+
+### Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Dependencies:
+- `numpy >= 1.21` -- Array operations and linear algebra
+- `torch >= 2.0` -- Neural networks and autograd
+- `pytest >= 7.0` -- Test framework
+
 ## Running Tests
 
+Run all 103 tests:
 ```bash
-cd selfdrive
-pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
-Run individual test files:
+Run a specific test file:
 ```bash
-pytest tests/test_traffic_behaviors.py -v
-pytest tests/test_simulator.py -v
+python -m pytest tests/test_traffic_behaviors.py -v
+python -m pytest tests/test_simulator.py -v
+```
+
+Run a single test:
+```bash
+python -m pytest tests/test_expert.py::TestExpertAgent::test_accelerates_on_empty_road -v
 ```
 
 ## Running the Full Comparison
+
+Train all agents and evaluate them side by side:
 
 ```bash
 python run_comparison.py
 ```
 
-Options:
+### Command-Line Options
+
 ```bash
 python run_comparison.py \
-  --num-lanes 3 \
-  --num-npcs 8 \
-  --collect-episodes 50 \
-  --bc-epochs 80 \
-  --wm-epochs 80 \
-  --rl-episodes 300 \
-  --eval-episodes 30
+  --num-lanes 3 \              # Number of highway lanes (default: 2)
+  --num-npcs 8 \               # Number of NPC vehicles (default: 8)
+  --collect-episodes 50 \      # Expert episodes for training data (default: 50)
+  --bc-epochs 80 \             # Behavior cloning training epochs (default: 80)
+  --wm-epochs 80 \             # World model training epochs (default: 80)
+  --rl-episodes 300 \          # REINFORCE training episodes (default: 300)
+  --eval-episodes 30           # Evaluation episodes per agent (default: 30)
+```
+
+### Pipeline Steps
+
+1. **Data Collection** -- Expert agent drives in the simulator, collecting (observation, action) trajectories
+2. **BC Training** -- Train an MLP policy to imitate expert actions via supervised learning
+3. **World Model Training** -- Train the attention world model to predict next observations
+4. **RL Training** -- Train a separate MLP policy via REINFORCE in the live simulator
+5. **Evaluation** -- Run all agents for N episodes, collecting metrics:
+   - Average reward and standard deviation
+   - Average speed (m/s)
+   - Collision rate
+   - Average episode length
+   - Lane changes per episode
+   - Episode completion rate
+
+## Debugging and Diagnostic Tools
+
+The project includes several scripts for diagnosing agent behavior and world model accuracy.
+
+### Simplified 1-Lane Debug
+
+Isolate longitudinal control by removing lane changes entirely. All agents should achieve 0% collision rate in this setting:
+
+```bash
+python run_simple_debug.py --seed 42 --eval-episodes 20
+```
+
+### Record and Visualize Episodes
+
+Record an episode as JSON, then open `debug_viewer.html` in a browser to visualize it:
+
+```bash
+# Record expert agent replay
+python record_episodes.py --num-lanes 2 --output replay_data.json
+
+# Record any agent with enhanced debug data (includes expert comparison)
+python record_debug.py --agent bc --seed 42 --output debug_episode.json
+python record_debug.py --agent planner_wm --wm-epochs 80 --output debug_episode.json
+python record_debug.py --agent rl --rl-episodes 300 --output debug_episode.json
+```
+
+Then open `debug_viewer.html` in a browser and load the JSON file.
+
+### Diagnose BC Collisions
+
+Find a seed where the BC agent collides, then replay step-by-step comparing BC vs Expert decisions:
+
+```bash
+python trace_bc_collision.py
+```
+
+Output shows per-step speed, gaps, and where BC disagrees with the expert (the likely collision cause).
+
+### World Model Accuracy
+
+Test whether WM prediction errors compound over longer planning horizons:
+
+```bash
+# Collision rate vs planning horizon (expect spike at longer horizons)
+python test_wm_horizon.py
+
+# Step-by-step comparison: hybrid WM rollout vs true simulator
+python verify_wm_rollout.py
+```
+
+### Planner Decision Debugging
+
+Dump the WM planner's internal reward breakdown when it gets "stuck" (speed < 22 m/s for 5+ steps):
+
+```bash
+python debug_planner_decision.py --seed 42 --debug-steps stuck
+python debug_planner_decision.py --seed 42 --debug-steps 50,100,150
 ```
 
 ## Key Design Decisions
 
 ### Modularity
-Every module has a clean interface and its own test file. Adding a new agent means:
-1. Subclass `Agent` in `agents/`
+Every module has a clean interface and its own test file. Adding a new agent requires:
+1. Subclass `Agent` in `agents/` -- implement `act(obs: np.ndarray) -> Action`
 2. Add it to the comparison dict in `run_comparison.py`
 3. Write tests in `tests/`
 
 ### Extensibility
-- **More lanes**: Change `num_lanes` in config — all modules handle it.
-- **Continuous actions**: Modify `Action` class and `VehicleDynamics` — agents and models adapt.
-- **Better RL**: Swap `rl_trainer.py` internals (e.g., PPO) — interface stays the same.
-- **Richer world model**: Add recurrence to `world_model.py` — planner interface unchanged.
+- **More lanes** -- Change `num_lanes` in config; all modules handle N-lane roads
+- **Continuous actions** -- Modify `Action` class and `VehicleDynamics`; agents and models adapt
+- **Better RL** -- Swap `rl_trainer.py` internals (e.g., PPO); the `Agent` interface stays the same
+- **Richer world model** -- Add recurrence or graph attention to `world_model.py`; planner interface unchanged
+- **New traffic behaviors** -- Subclass `TrafficBehavior` and add to the behavior mix in `TrafficConfig`
 
-### Action Space
-9 discrete actions: 3 longitudinal (brake/keep/accelerate) × 3 lateral (left/keep/right).
+### Reward Structure
 
-### Observation Space
-Fixed-size vector: `[ego_speed, ego_lane, ego_x, neighbor_1..K × (rel_x, rel_lane, rel_speed, exists)]`
-
-### Attention World Model
-Each vehicle is a token. Self-attention captures inter-vehicle interactions (e.g., braking cascade). Predicts state deltas (residual learning). Handles variable neighbor counts via attention masking.
+The reward function in the simulator combines multiple terms:
+- **Collision penalty** -- Large negative reward on collision (default: -100)
+- **Speed reward** -- Linear reward for driving near the speed limit
+- **Lane-change penalty** -- Small penalty to discourage unnecessary lane changes
+- **Hard-brake penalty** -- Penalizes abrupt deceleration for ride comfort

@@ -56,7 +56,7 @@ class TestBCTrainer:
         obs = np.random.randn(100, obs_dim).astype(np.float32)
         actions = np.random.randint(0, 9, size=100).astype(np.int64)
 
-        losses = trainer.train(obs, actions, num_epochs=20, verbose=False)
+        losses, _normalizer = trainer.train(obs, actions, num_epochs=20, verbose=False)
         assert losses[-1] < losses[0], "Loss should decrease"
 
     def test_overfits_small_data(self):
@@ -69,7 +69,7 @@ class TestBCTrainer:
         obs = np.random.randn(10, obs_dim).astype(np.float32)
         actions = np.full(10, 4, dtype=np.int64)
 
-        losses = trainer.train(obs, actions, num_epochs=100, verbose=False)
+        losses, _normalizer = trainer.train(obs, actions, num_epochs=100, verbose=False)
         assert losses[-1] < 0.1, f"Should overfit, got loss={losses[-1]}"
 
 
