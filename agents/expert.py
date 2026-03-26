@@ -399,9 +399,15 @@ class ExpertAgent(Agent):
         behind = self._find_closest_behind(neighbors, lane_offset)
 
         # Reject if there is a vehicle ahead in the target lane that is
-        # too close.
-        if ahead is not None and ahead["rel_x"] < min_gap_ahead:
-            return False
+        # too close. Use physics-based stopping distance when closing on
+        # the target-lane NPC to avoid merging into a shrinking gap.
+        if ahead is not None:
+            closing_speed = max(-ahead["rel_speed"], 0.0)
+            max_decel = 5.0  # VehicleConfig.max_deceleration
+            stopping_dist = (closing_speed ** 2) / (2 * max_decel) + 10.0
+            effective_ahead = max(min_gap_ahead, stopping_dist)
+            if ahead["rel_x"] < effective_ahead:
+                return False
         # Reject if there is a vehicle behind in the target lane that is
         # too close.  abs() is used because rel_x is negative for followers.
         if behind is not None and abs(behind["rel_x"]) < min_gap_behind:

@@ -144,6 +144,7 @@ class BCAgent(Agent):
         target_lane = ego_lane + lateral
         min_target_ahead = float('inf')   # closest NPC ahead in target lane
         min_target_behind = float('inf')  # closest NPC behind in target lane
+        closing_speed_target = 0.0        # closing speed to nearest target-lane NPC ahead
 
         # Scan all NPC slots to find the closest relevant vehicles.
         # Also track closing speed to the nearest same-lane NPC ahead for
@@ -171,17 +172,22 @@ class BCAgent(Agent):
 
             # Target lane check (only relevant if a lane change is requested):
             # track the closest vehicle ahead and behind in the lane we want
-            # to merge into
+            # to merge into, plus its closing speed
             if lateral != 0 and abs(npc_lane - target_lane) < 0.5:
                 if rel_x > 0:
-                    min_target_ahead = min(min_target_ahead, rel_x)
+                    if rel_x < min_target_ahead:
+                        min_target_ahead = rel_x
+                        closing_speed_target = max(-rel_speed, 0.0)
                 else:
                     min_target_behind = min(min_target_behind, abs(rel_x))
 
         # Emergency mode: vehicle directly ahead is dangerously close (<10m)
         emergency = min_gap_ahead < 10.0
 
-        # Block unsafe lane changes based on target lane clearance
+        # Block unsafe lane changes based on target lane clearance.
+        # Use physics-based stopping distance for the ahead threshold when
+        # closing on a target-lane NPC, so we don't merge into a shrinking gap.
+        max_decel = 5.0  # VehicleConfig.max_deceleration
         if lateral != 0:
             if emergency:
                 # In emergency, allow tighter merges (evasive action) but
@@ -189,9 +195,11 @@ class BCAgent(Agent):
                 if min_target_ahead < 5.0 or min_target_behind < 5.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
             else:
-                # In normal driving, require 15m clearance for lane changes
-                # to ensure comfortable and safe merging
-                if min_target_ahead < 15.0 or min_target_behind < 15.0:
+                # Physics-based ahead clearance: if closing on the target-lane
+                # NPC, require enough room to stop safely after merging
+                target_stopping = (closing_speed_target ** 2) / (2 * max_decel) + 10.0
+                safe_ahead = max(15.0, target_stopping)
+                if min_target_ahead < safe_ahead or min_target_behind < 15.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
 
         # Three-state following distance logic (same-lane only), matching

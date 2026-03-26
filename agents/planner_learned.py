@@ -530,6 +530,7 @@ class PlannerLearnedModel(Agent):
         closing_speed_ahead = 0.0         # closing speed to that NPC (positive = approaching)
         min_target_ahead = float('inf')   # closest NPC ahead in target lane
         min_target_behind = float('inf')  # closest NPC behind in target lane
+        closing_speed_target = 0.0        # closing speed to nearest target-lane NPC ahead
 
         for i in range(k):
             base = 3 + i * 4
@@ -549,10 +550,12 @@ class PlannerLearnedModel(Agent):
                     # ego is faster (closing). Convert to positive closing speed.
                     closing_speed_ahead = max(-rel_speed, 0.0)
 
-            # Target lane: track gaps for the lane we want to merge into
+            # Target lane: track gaps and closing speed for merge safety
             if lateral != 0 and abs(npc_lane - target_lane) < 0.5:
                 if rel_x > 0:
-                    min_target_ahead = min(min_target_ahead, rel_x)
+                    if rel_x < min_target_ahead:
+                        min_target_ahead = rel_x
+                        closing_speed_target = max(-rel_speed, 0.0)
                 else:
                     min_target_behind = min(min_target_behind, abs(rel_x))
 
@@ -560,7 +563,9 @@ class PlannerLearnedModel(Agent):
         # collide if we stay in this lane
         emergency = min_gap_ahead < 10.0
 
-        # Block unsafe lane changes based on target lane clearance
+        # Block unsafe lane changes based on target lane clearance.
+        # Use physics-based stopping distance for the ahead threshold when
+        # closing on a target-lane NPC, so we don't merge into a shrinking gap.
         if lateral != 0:
             if emergency:
                 # In emergency, allow tighter merges for evasion but still
@@ -568,8 +573,11 @@ class PlannerLearnedModel(Agent):
                 if min_target_ahead < 5.0 or min_target_behind < 5.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
             else:
-                # Normal driving: require 15m clearance for comfortable merge
-                if min_target_ahead < 15.0 or min_target_behind < 15.0:
+                # Physics-based ahead clearance: if closing on the target-lane
+                # NPC, require enough room to stop safely after merging
+                target_stopping = (closing_speed_target ** 2) / (2 * self.vc.max_deceleration) + 10.0
+                safe_ahead = max(15.0, target_stopping)
+                if min_target_ahead < safe_ahead or min_target_behind < 15.0:
                     action = Action(action.longitudinal, LateralAction.KEEP)
 
         # Three-state following distance logic (same-lane only), mirroring
@@ -711,8 +719,9 @@ class PlannerLearnedModel(Agent):
 
         # Check 3: Lane change into occupied space.
         # If ego just changed lanes, check that the target lane has
-        # sufficient clearance: 15m ahead and 10m behind. If not, this
-        # is treated as a catastrophic collision-risk event (-100).
+        # sufficient clearance. The ahead threshold uses physics-based
+        # stopping distance when closing on the target-lane NPC, so we
+        # penalize merging into a shrinking gap.
         changed_lane = (ego_lanes != prev_lanes)
         if np.any(changed_lane):
             for n in range(k):
@@ -725,8 +734,11 @@ class PlannerLearnedModel(Agent):
                 if not np.any(in_new_lane):
                     continue
                 gap = npc_xs[:, n] - ego_xs  # positive = NPC ahead
-                # Unsafe if NPC ahead is within 15m or NPC behind is within 10m
-                unsafe_ahead = in_new_lane & (gap > 0) & (gap < 15.0)
+                # Physics-based ahead clearance: closing_speed² / (2a) + 10m
+                closing = np.maximum(ego_speeds - npc_speeds[:, n], 0.0)
+                stopping_dist = (closing ** 2) / (2 * max_decel) + 10.0
+                safe_ahead = np.maximum(15.0, stopping_dist)
+                unsafe_ahead = in_new_lane & (gap > 0) & (gap < safe_ahead)
                 unsafe_behind = in_new_lane & (gap <= 0) & (np.abs(gap) < 10.0)
                 rewards[unsafe_ahead | unsafe_behind] = -100.0
 
