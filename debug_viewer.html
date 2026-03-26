@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Self-Driving Debug Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Courier New', monospace; background: #0a0a0f; color: #c8c8d0; }
+  .header { padding: 12px 20px; background: #12121a; border-bottom: 1px solid #2a2a3a;
+            display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .header h1 { font-size: 14px; color: #7a7aff; letter-spacing: 2px; text-transform: uppercase; }
+  .load-btn { padding: 6px 14px; background: #2a2a4a; border: 1px solid #4a4a6a;
+              color: #aab; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px; }
+  .load-btn:hover { background: #3a3a5a; }
+  .info-bar { padding: 8px 20px; background: #0e0e16; font-size: 12px; color: #888;
+              display: flex; gap: 20px; flex-wrap: wrap; border-bottom: 1px solid #1a1a2a; }
+  .info-bar span { color: #aaa; }
+  .info-bar .val { color: #7a7aff; }
+  .info-bar .collision { color: #ff4a4a; font-weight: bold; }
+  .main { display: flex; flex-direction: column; height: calc(100vh - 90px); }
+  .road-container { flex: 0 0 auto; padding: 12px 20px; }
+  canvas { width: 100%; border-radius: 6px; border: 1px solid #2a2a3a; display: block; }
+  .controls { padding: 8px 20px; display: flex; align-items: center; gap: 12px;
+              background: #0e0e16; border-top: 1px solid #1a1a2a; flex-wrap: wrap; }
+  .controls button { padding: 4px 12px; background: #2a2a4a; border: 1px solid #4a4a6a;
+                     color: #aab; border-radius: 4px; cursor: pointer; font-family: inherit;
+                     font-size: 12px; min-width: 50px; }
+  .controls button:hover { background: #3a3a5a; }
+  .controls button.active { background: #4a4a8a; border-color: #7a7aff; }
+  .controls input[type=range] { flex: 1; min-width: 200px; accent-color: #7a7aff; }
+  .controls label { font-size: 11px; color: #666; }
+  .controls .step-display { font-size: 13px; color: #7a7aff; min-width: 80px; }
+  .panels { flex: 1; display: flex; gap: 0; overflow: hidden; border-top: 1px solid #1a1a2a; }
+  .panel { flex: 1; padding: 12px 16px; overflow-y: auto; font-size: 12px; line-height: 1.6; }
+  .panel-left { border-right: 1px solid #1a1a2a; }
+  .panel h3 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px;
+              margin-bottom: 6px; }
+  .metric { display: flex; justify-content: space-between; padding: 2px 0; }
+  .metric .k { color: #888; }
+  .metric .v { color: #ccc; }
+  .metric .v.warn { color: #ffaa33; }
+  .metric .v.bad { color: #ff4a4a; }
+  .metric .v.good { color: #4aff7a; }
+  .disagree { background: #3a2a00; padding: 1px 4px; border-radius: 2px; }
+  .npc-list { margin-top: 8px; }
+  .npc-row { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid #1a1a1a; }
+  .npc-row .nid { color: #4a8aff; min-width: 50px; }
+  .dump-area { margin-top: 12px; }
+  .dump-btn { padding: 6px 14px; background: #2a4a2a; border: 1px solid #4a6a4a;
+              color: #aab; border-radius: 4px; cursor: pointer; font-family: inherit;
+              font-size: 12px; width: 100%; margin-bottom: 8px; }
+  .dump-btn:hover { background: #3a5a3a; }
+  .dump-output { background: #0a0a10; border: 1px solid #2a2a3a; border-radius: 4px;
+                 padding: 8px; font-size: 11px; max-height: 200px; overflow-y: auto;
+                 white-space: pre-wrap; word-break: break-all; color: #999; display: none; }
+  .legend { display: flex; gap: 16px; padding: 4px 20px; font-size: 11px; color: #666; }
+  .legend span::before { content: ''; display: inline-block; width: 10px; height: 10px;
+                          border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .legend .ego::before { background: #1adf6f; }
+  .legend .npc::before { background: #4a8aff; }
+  .legend .crash::before { background: #ff4a4a; }
+  .legend .disagree-l::before { background: #ffaa33; }
+  .speed-label { font-size: 11px; color: #444; margin-left: 8px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Self-Drive Debugger</h1>
+  <input type="file" id="fileInput" accept=".json" style="display:none">
+  <button class="load-btn" onclick="document.getElementById('fileInput').click()">Load JSON</button>
+  <span id="filename" style="font-size:12px; color:#555;"></span>
+</div>
+<div class="info-bar" id="infoBar">
+  <span>No episode loaded. Use <b>record_debug.py</b> to generate a JSON file, then load it here.</span>
+</div>
+<div class="main">
+  <div class="road-container">
+    <canvas id="road" width="1200" height="160"></canvas>
+  </div>
+  <div class="legend">
+    <span class="ego">Ego</span>
+    <span class="npc">NPC</span>
+    <span class="crash">Collision</span>
+    <span class="disagree-l">Expert disagrees</span>
+  </div>
+  <div class="controls">
+    <button id="prevBtn" onclick="stepTo(curStep-1)">&#9664;</button>
+    <button id="playBtn" onclick="togglePlay()">&#9654;</button>
+    <button id="nextBtn" onclick="stepTo(curStep+1)">&#9654;|</button>
+    <button onclick="stepTo(0)">Reset</button>
+    <input type="range" id="scrubber" min="0" max="0" value="0" oninput="stepTo(+this.value)">
+    <span class="step-display" id="stepDisplay">0 / 0</span>
+    <label>Speed</label>
+    <input type="range" id="speedSlider" min="1" max="30" value="8" style="flex:0 0 100px;">
+    <button id="nextDisagree" onclick="jumpNextDisagree()" style="background:#3a2a00;border-color:#6a5a2a;">
+      Next disagree &#8623;
+    </button>
+    <button id="nextCollision" onclick="jumpCollision()" style="background:#3a1a1a;border-color:#6a3a3a;">
+      Jump to crash &#8623;
+    </button>
+  </div>
+  <div class="panels">
+    <div class="panel panel-left">
+      <h3>Step details</h3>
+      <div id="stepDetails"></div>
+      <div class="dump-area">
+        <h3 style="margin-top:12px;">Dump for Claude</h3>
+        <button class="dump-btn" onclick="dumpRange()">Dump last 20 steps</button>
+        <button class="dump-btn" onclick="dumpAroundCrash()">Dump around crash</button>
+        <button class="dump-btn" onclick="dumpFull()">Dump full summary</button>
+        <button class="dump-btn" onclick="dumpAllSteps()">Dump all steps</button>
+        <div class="dump-output" id="dumpOutput"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Vehicles at step</h3>
+      <div id="vehicleDetails"></div>
+    </div>
+  </div>
+</div>
+<script>
+let data = null;
+let curStep = 0;
+let playing = false;
+let playTimer = null;
+
+const canvas = document.getElementById('road');
+const ctx = canvas.getContext('2d');
+const LON = {"-1":"BRK","0":"KP","1":"ACC"};
+const LAT = {"-1":"L","0":"-","1":"R"};
+function actionStr(a) { return a ? LON[a.lon]+"/"+LAT[a.lat] : "-"; }
+
+document.getElementById('fileInput').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('filename').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    data = JSON.parse(ev.target.result);
+    curStep = 0;
+    document.getElementById('scrubber').max = data.frames.length - 1;
+    updateInfoBar();
+    render();
+  };
+  reader.readAsText(file);
+  // Reset so the same file can be re-loaded after changes
+  e.target.value = '';
+});
+
+function updateInfoBar() {
+  if (!data) return;
+  const c = data.config, s = data.summary;
+  const colStr = s.collision ? '<span class="collision">COLLISION</span>' : '<span style="color:#4aff7a">OK</span>';
+  document.getElementById('infoBar').innerHTML =
+    `<span>Agent: <span class="val">${c.agent}</span></span>` +
+    `<span>Seed: <span class="val">${c.seed}</span></span>` +
+    `<span>Lanes: <span class="val">${c.num_lanes}</span></span>` +
+    `<span>NPCs: <span class="val">${c.num_npcs}</span></span>` +
+    `<span>Steps: <span class="val">${s.total_steps}</span></span>` +
+    `<span>Reward: <span class="val">${s.total_reward}</span></span>` +
+    `<span>Result: ${colStr}</span>` +
+    `<span>Disagrees: <span class="val">${s.disagree_count}</span></span>`;
+}
+
+function stepTo(s) {
+  if (!data) return;
+  curStep = Math.max(0, Math.min(s, data.frames.length - 1));
+  document.getElementById('scrubber').value = curStep;
+  render();
+}
+
+function togglePlay() {
+  playing = !playing;
+  document.getElementById('playBtn').textContent = playing ? '⏸' : '▶';
+  if (playing) {
+    playTimer = setInterval(() => {
+      if (curStep >= data.frames.length - 1) { togglePlay(); return; }
+      stepTo(curStep + 1);
+    }, 1000 / (+document.getElementById('speedSlider').value));
+  } else {
+    clearInterval(playTimer);
+  }
+}
+
+function jumpNextDisagree() {
+  if (!data) return;
+  for (let i = curStep + 1; i < data.frames.length; i++) {
+    if (data.frames[i].disagree) { stepTo(i); return; }
+  }
+}
+
+function jumpCollision() {
+  if (!data) return;
+  for (let i = 0; i < data.frames.length; i++) {
+    if (data.frames[i].collision) { stepTo(Math.max(0, i - 5)); return; }
+  }
+}
+
+function render() {
+  if (!data) return;
+  const f = data.frames[curStep];
+  const cfg = data.config;
+  document.getElementById('stepDisplay').textContent = `${curStep} / ${data.frames.length-1}`;
+  drawRoad(f, cfg);
+  drawDetails(f);
+  drawVehicles(f, cfg);
+}
+
+function drawRoad(f, cfg) {
+  const W = canvas.width, H = canvas.height;
+  const numLanes = cfg.num_lanes;
+  const laneH = H / numLanes;
+  const egoX = f.ego.x;
+  const viewL = egoX - 100, viewR = egoX + 150;
+  const sc = W / (viewR - viewL);
+  const toX = wx => (wx - viewL) * sc;
+  const toY = lane => lane * laneH + laneH / 2;
+
+  ctx.fillStyle = '#1a1a24';
+  ctx.fillRect(0, 0, W, H);
+
+  // Lane dividers
+  ctx.setLineDash([14, 10]);
+  ctx.strokeStyle = '#333340';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < numLanes; i++) {
+    ctx.beginPath(); ctx.moveTo(0, i*laneH); ctx.lineTo(W, i*laneH); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // Road edges
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W,0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,H); ctx.lineTo(W,H); ctx.stroke();
+
+  const carW = 22, carH = laneH * 0.5;
+
+  // NPCs
+  f.npcs.forEach(n => {
+    const cx = toX(n.x), cy = toY(n.lane);
+    if (cx < -30 || cx > W + 30) return;
+    ctx.fillStyle = '#4a8aff';
+    ctx.beginPath();
+    ctx.roundRect(cx - carW/2, cy - carH/2, carW, carH, 3);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '10px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(Math.round(n.speed), cx, cy + 3);
+    ctx.fillStyle = '#4a6a9a';
+    ctx.font = '8px Courier New';
+    ctx.fillText(n.id, cx, cy - carH/2 - 3);
+  });
+
+  // Ego
+  const ecx = toX(f.ego.x), ecy = toY(f.ego.lane);
+  const egoColor = f.collision ? '#ff4a4a' : (f.disagree ? '#ffaa33' : '#1adf6f');
+  ctx.fillStyle = egoColor;
+  ctx.beginPath();
+  ctx.roundRect(ecx - carW/2, ecy - carH/2, carW, carH, 3);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 11px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText(Math.round(f.ego.speed), ecx, ecy + 4);
+
+  if (f.collision) {
+    ctx.strokeStyle = '#ff4a4a';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(ecx, ecy, carH, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = '#ff4a4a';
+    ctx.font = 'bold 14px Courier New';
+    ctx.fillText('CRASH', ecx, ecy - carH - 4);
+  }
+
+  // Action arrow
+  if (f.action) {
+    ctx.fillStyle = '#888';
+    ctx.font = '11px Courier New';
+    ctx.textAlign = 'left';
+    ctx.fillText(actionStr(f.action), ecx + carW/2 + 4, ecy + 4);
+  }
+}
+
+function drawDetails(f) {
+  const el = document.getElementById('stepDetails');
+  const da = f.disagree ? ' <span class="disagree">DISAGREE</span>' : '';
+  const gaClass = f.gap_ahead !== null && f.gap_ahead < 15 ? (f.gap_ahead < 8 ? 'bad' : 'warn') : 'good';
+
+  let laneGapHtml = '';
+  if (f.lane_gaps) {
+    laneGapHtml = '<div style="margin-top:6px;border-top:1px solid #1a1a2a;padding-top:4px;">';
+    for (const [lane, gaps] of Object.entries(f.lane_gaps)) {
+      const isCur = parseInt(lane) === f.ego.lane;
+      const label = isCur ? `Lane ${lane} (ego)` : `Lane ${lane}`;
+      const style = isCur ? 'color:#7a7aff;' : '';
+      const ah = gaps.ahead !== null ? gaps.ahead + 'm' : '—';
+      const bh = gaps.behind !== null ? gaps.behind + 'm' : '—';
+      const ahClass = gaps.ahead !== null && gaps.ahead < 15 ? (gaps.ahead < 8 ? 'bad' : 'warn') : '';
+      const bhClass = gaps.behind !== null && gaps.behind < 15 ? (gaps.behind < 8 ? 'bad' : 'warn') : '';
+      laneGapHtml += `<div class="metric"><span class="k" style="${style}">${label}</span><span class="v ${ahClass}">↑${ah}</span><span class="v ${bhClass}" style="margin-left:8px">↓${bh}</span></div>`;
+    }
+    laneGapHtml += '</div>';
+  }
+
+  el.innerHTML = `
+    <div class="metric"><span class="k">Step</span><span class="v">${f.step}</span></div>
+    <div class="metric"><span class="k">Reward</span><span class="v">${f.reward}</span></div>
+    <div class="metric"><span class="k">Cumulative</span><span class="v">${f.cumulative_reward}</span></div>
+    <div class="metric"><span class="k">Ego speed</span><span class="v">${f.ego.speed} m/s</span></div>
+    <div class="metric"><span class="k">Ego lane</span><span class="v">${f.ego.lane}</span></div>
+    <div class="metric"><span class="k">Ego x</span><span class="v">${f.ego.x}</span></div>
+    <div class="metric"><span class="k">Action</span><span class="v">${actionStr(f.action)}${da}</span></div>
+    <div class="metric"><span class="k">Expert</span><span class="v">${actionStr(f.expert_action)}</span></div>
+    <div class="metric"><span class="k">Gap ahead</span><span class="v ${gaClass}">${f.gap_ahead !== null ? f.gap_ahead+'m' : '—'}</span></div>
+    <div class="metric"><span class="k">Gap behind</span><span class="v">${f.gap_behind !== null ? f.gap_behind+'m' : '—'}</span></div>
+    <div class="metric"><span class="k">Collision</span><span class="v ${f.collision?'bad':'good'}">${f.collision}</span></div>
+    ${laneGapHtml}
+  `;
+}
+
+function drawVehicles(f, cfg) {
+  const el = document.getElementById('vehicleDetails');
+  let html = `<div class="npc-row" style="color:#666;border:none;">
+    <span class="nid">ID</span><span style="min-width:50px">Lane</span>
+    <span style="min-width:60px">Speed</span><span style="min-width:70px">Rel X</span></div>`;
+  const sorted = [...f.npcs].sort((a,b) => a.x - b.x);
+  sorted.forEach(n => {
+    const relx = (n.x - f.ego.x).toFixed(1);
+    const sameLane = n.lane === f.ego.lane;
+    const close = sameLane && Math.abs(n.x - f.ego.x) < 20;
+    html += `<div class="npc-row" style="${close ? 'color:#ffaa33;' : ''}">
+      <span class="nid">${n.id}</span>
+      <span style="min-width:50px">${n.lane}</span>
+      <span style="min-width:60px">${n.speed}</span>
+      <span style="min-width:70px">${relx}</span></div>`;
+  });
+  el.innerHTML = html;
+}
+
+function fmtLaneGaps(f) {
+  if (!f.lane_gaps) return '';
+  let parts = [];
+  for (const [lane, gaps] of Object.entries(f.lane_gaps)) {
+    const ah = gaps.ahead !== null ? gaps.ahead : '-';
+    const bh = gaps.behind !== null ? gaps.behind : '-';
+    parts.push(`L${lane}[↑${ah} ↓${bh}]`);
+  }
+  return parts.join(' ');
+}
+
+function dumpRange() {
+  if (!data) return;
+  const start = Math.max(0, curStep - 19);
+  const end = curStep;
+  let txt = `=== Dump: steps ${start}-${end} ===\n`;
+  txt += `Agent: ${data.config.agent}, Seed: ${data.config.seed}, Lanes: ${data.config.num_lanes}\n\n`;
+  txt += `Step | EgoSpd | Lane | Action  | Expert  | Reward | Lane Gaps\n`;
+  txt += `-----|--------|------|---------|---------|--------|----------\n`;
+  for (let i = start; i <= end; i++) {
+    const f = data.frames[i];
+    if (!f) continue;
+    txt += `${String(f.step).padStart(4)} | ${f.ego.speed.toFixed(1).padStart(6)} | ${f.ego.lane.toString().padStart(4)} | ${actionStr(f.action).padStart(7)} | ${actionStr(f.expert_action).padStart(7)} | ${f.reward.toFixed(2).padStart(6)} | ${fmtLaneGaps(f)}\n`;
+  }
+  showDump(txt);
+}
+
+function dumpAroundCrash() {
+  if (!data) return;
+  let crashStep = -1;
+  for (let i = 0; i < data.frames.length; i++) {
+    if (data.frames[i].collision) { crashStep = i; break; }
+  }
+  if (crashStep < 0) { showDump("No collision in this episode."); return; }
+  const start = Math.max(0, crashStep - 30);
+  let txt = `=== Crash at step ${crashStep} ===\n`;
+  txt += `Agent: ${data.config.agent}, Seed: ${data.config.seed}, Lanes: ${data.config.num_lanes}\n\n`;
+  txt += `Step | EgoSpd | Lane | Action  | Expert  | Lane Gaps\n`;
+  txt += `-----|--------|------|---------|---------|----------\n`;
+  for (let i = start; i <= crashStep; i++) {
+    const f = data.frames[i];
+    if (!f) continue;
+    txt += `${String(f.step).padStart(4)} | ${f.ego.speed.toFixed(1).padStart(6)} | ${f.ego.lane.toString().padStart(4)} | ${actionStr(f.action).padStart(7)} | ${actionStr(f.expert_action).padStart(7)} | ${fmtLaneGaps(f)}\n`;
+  }
+  txt += `\nNPCs at crash:\n`;
+  const cf = data.frames[crashStep];
+  cf.npcs.forEach(n => {
+    txt += `  NPC ${n.id}: lane=${n.lane} x=${n.x} speed=${n.speed} gap=${(n.x-cf.ego.x).toFixed(1)}\n`;
+  });
+  showDump(txt);
+}
+
+function dumpFull() {
+  if (!data) return;
+  let txt = `=== Full Episode Summary (viewer v2) ===\n`;
+  txt += JSON.stringify(data.config, null, 2) + '\n';
+  txt += JSON.stringify(data.agent_info, null, 2) + '\n';
+  txt += JSON.stringify(data.summary, null, 2) + '\n';
+  txt += `\nDisagree steps:\n`;
+  data.frames.forEach(f => {
+    if (f.disagree) txt += `  step ${f.step}: agent=${actionStr(f.action)} expert=${actionStr(f.expert_action)} lane=${f.ego.lane} ${fmtLaneGaps(f)}\n`;
+  });
+  showDump(txt);
+}
+
+function dumpAllSteps() {
+  if (!data) return;
+  let txt = `=== All Steps (viewer v2) ===\n`;
+  txt += JSON.stringify(data.config, null, 2) + '\n';
+  txt += JSON.stringify(data.summary, null, 2) + '\n\n';
+  txt += `Step | EgoSpd | Lane | Action  | Expert  | Reward  | CumRew | Lane Gaps\n`;
+  txt += `-----|--------|------|---------|---------|---------|--------|----------\n`;
+  let prevLane = null;
+  data.frames.forEach(f => {
+    if (!f.action) { prevLane = f.ego.lane; return; }
+    let marker = '';
+    if (prevLane !== null && f.ego.lane !== prevLane) marker = ' <== LANE CHANGE';
+    if (f.disagree) marker += ' [DISAGREE]';
+    if (f.collision) marker = ' *** COLLISION ***';
+    txt += `${String(f.step).padStart(4)} | ${f.ego.speed.toFixed(1).padStart(6)} | ${f.ego.lane.toString().padStart(4)} | ${actionStr(f.action).padStart(7)} | ${actionStr(f.expert_action).padStart(7)} | ${f.reward.toFixed(2).padStart(7)} | ${f.cumulative_reward.toFixed(1).padStart(6)} | ${fmtLaneGaps(f)}${marker}\n`;
+    prevLane = f.ego.lane;
+  });
+  showDump(txt);
+}
+
+function showDump(txt) {
+  const el = document.getElementById('dumpOutput');
+  el.style.display = 'block';
+  el.textContent = txt;
+  navigator.clipboard.writeText(txt).catch(() => {});
+}
+</script>
+</body>
+</html>
