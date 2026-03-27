@@ -346,12 +346,10 @@ class ModelConfig:
         wm_num_layers: Number of stacked Transformer encoder layers.
         wm_max_vehicles: Maximum number of vehicle tokens the world model
             can attend over (ego + k_neighbors).
-        learning_rate: Adam learning rate shared by BC, RL, and WM training.
+        learning_rate: Adam learning rate shared by BC and WM training.
         batch_size: Mini-batch size for all gradient-based training loops.
         bc_epochs: Number of epochs for behavioural-cloning pre-training.
         wm_epochs: Number of epochs for world-model training.
-        rl_episodes: Number of on-policy episodes to collect during RL
-            fine-tuning.
         planner_horizon: Rollout depth (in sim steps) for the *true-sim*
             planner, which can afford a longer horizon because the dynamics
             are exact.
@@ -378,7 +376,6 @@ class ModelConfig:
     batch_size: int = 64
     bc_epochs: int = 200           # behavioural-cloning epochs
     wm_epochs: int = 20            # world-model training epochs
-    rl_episodes: int = 500         # on-policy RL collection episodes
 
     # -- Planner hyper-parameters --
     planner_horizon: int = 30           # for planner_true (uses real sim)

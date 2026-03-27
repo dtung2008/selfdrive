@@ -19,8 +19,7 @@ Pipeline executed in main():
   2. Collect demonstration trajectories with the expert.
   3. Train a Behavior Cloning (BC) policy on those demonstrations.
   4. Train an attention-based World Model on (obs, act, next_obs) tuples.
-  5. Fine-tune the BC policy with REINFORCE (warm-started RL).
-  6. Build planners (true-model and learned-WM) and evaluate all agents.
+  5. Build planners (true-model and learned-WM) and evaluate all agents.
 
 This isolates the longitudinal control problem and removes all
 stochasticity from the environment.
@@ -40,7 +39,6 @@ from models.world_model import AttentionWorldModel
 from training.data_collector import DataCollector, trajectories_to_arrays
 from training.bc_trainer import BCTrainer
 from training.world_model_trainer import WorldModelTrainer
-from training.rl_trainer import RLTrainer
 from training.evaluator import Evaluator
 
 
@@ -85,7 +83,6 @@ def main():
     parser.add_argument("--collect-episodes", type=int, default=50)
     parser.add_argument("--bc-epochs", type=int, default=200)
     parser.add_argument("--wm-epochs", type=int, default=20)
-    parser.add_argument("--rl-episodes", type=int, default=300)
     parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument("--planner-horizon", type=int, default=30)
     parser.add_argument("--planner-rollouts", type=int, default=50)
@@ -148,8 +145,8 @@ def main():
     # ---- 3. Train BC ----
     # Supervised learning: the policy network learns to imitate the expert's
     # action distribution.  BCTrainer.train() returns (losses, ObsNormalizer)
-    # — the normalizer is needed by BCAgent and later by the RL trainer so
-    # that observations are on the same scale the policy was trained on.
+    # — the normalizer is needed by BCAgent so that observations are on the
+    # same scale the policy was trained on.
     print(f"\n[3/5] Training Behavior Cloning ({args.bc_epochs} epochs)...")
     bc_policy = PolicyNetwork(obs_dim, hidden_dim=64, num_layers=2)
     bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
@@ -238,25 +235,6 @@ def main():
                 print(f"    (real sim ended at step {step+1})")
                 break
 
-    # ---- 5. Train RL (warm-started from BC policy) ----
-    # Warm-starting from BC gives REINFORCE a much better initial policy than
-    # random, so it mainly fine-tunes rather than learning from scratch.
-    # We use a low learning rate (1e-4) and low entropy coefficient (0.005)
-    # to avoid destroying the useful structure already learned by BC.
-    print(f"\n[5/5] Training RL ({args.rl_episodes} episodes, warm-start from BC)...")
-    # Copy BC policy weights as starting point
-    import copy
-    rl_policy = copy.deepcopy(bc_policy)
-    sim_rl = Simulator(cfg, seed=args.seed + 1)
-    rl_trainer = RLTrainer(rl_policy, sim_rl, lr=1e-4, gamma=0.99,
-                            entropy_coef=0.005)
-    # The RL trainer must normalize observations the same way BC did,
-    # otherwise the copied policy weights will see a different input
-    # distribution and perform randomly.
-    rl_trainer.obs_normalizer = bc_normalizer
-    rl_rewards = rl_trainer.train(num_episodes=args.rl_episodes, verbose=True)
-    rl_agent = BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer)
-
     # ---- Build planners ----
     # Two planners: one uses the real simulator (oracle), the other uses the
     # learned world model.  Comparing them reveals WM prediction quality.
@@ -282,7 +260,6 @@ def main():
         "Behavior Cloning": bc_agent,
         "Planner (true)": planner_true,
         "Planner (learned WM)": planner_learned,
-        "RL (REINFORCE)": rl_agent,
     }
 
     results = {}

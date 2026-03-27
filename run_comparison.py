@@ -15,20 +15,15 @@ Pipeline overview (6 stages):
                             environment dynamics (obs, action) -> next_obs so
                             that a planner can do lookahead without querying
                             the real simulator.
-  5. RL training         -- REINFORCE policy gradient, warm-started from the
-                            BC policy so that exploration begins from a
-                            reasonable baseline instead of random actions.
-  6. Evaluation          -- Every agent (expert, BC, planner-true,
-                            planner-learned, RL) is evaluated on the same
-                            set of episodes and the results are compared.
+  5. Evaluation          -- Every agent (expert, BC, planner-true,
+                            planner-learned) is evaluated on the same set
+                            of episodes and the results are compared.
 
 Agents compared:
   1. Expert (rule-based)
   2. Behavior Cloning (supervised, imitating expert)
   3. Planner with True Model (MPC using real simulator)
   4. Planner with Learned World Model (MPC using attention model)
-  5. RL Policy (REINFORCE)
-
 Usage:
     python run_comparison.py [--num-lanes 2] [--episodes 50] [--seed 42]
 """
@@ -47,7 +42,6 @@ from models.world_model import AttentionWorldModel
 from training.data_collector import DataCollector, trajectories_to_arrays
 from training.bc_trainer import BCTrainer
 from training.world_model_trainer import WorldModelTrainer
-from training.rl_trainer import RLTrainer
 from training.evaluator import Evaluator
 
 
@@ -55,7 +49,7 @@ def main():
     # ---- Argument parsing ----
     # Each flag controls a different stage of the pipeline or the environment
     # configuration.  Defaults are tuned for a quick local run; bump
-    # --collect-episodes and --rl-episodes for better trained agents.
+    # --collect-episodes for better trained agents.
     parser = argparse.ArgumentParser(description="Self-Driving Agent Comparison")
     # Road geometry: 1 lane = car-following only; 2+ lanes = lane changes
     parser.add_argument("--num-lanes", type=int, default=2)
@@ -70,8 +64,6 @@ def main():
     parser.add_argument("--bc-epochs", type=int, default=200)
     # Training epochs for the attention-based world model
     parser.add_argument("--wm-epochs", type=int, default=20)
-    # Number of on-policy episodes for REINFORCE RL training
-    parser.add_argument("--rl-episodes", type=int, default=300)
     # Number of episodes used to evaluate each agent at the end
     parser.add_argument("--eval-episodes", type=int, default=20)
     # MPC planning horizon (number of future steps the planner considers)
@@ -135,7 +127,7 @@ def main():
     # (obs, action, reward, next_obs, done) are used for both BC training
     # (obs -> action) and world-model training (obs, action -> next_obs).
     # A dedicated simulator instance (sim_collect) is created so its internal
-    # state doesn't interfere with simulators used later for RL or evaluation.
+    # state doesn't interfere with simulators used later for evaluation.
     print(f"\n[2/5] Collecting {args.collect_episodes} episodes of expert data...")
     sim_collect = Simulator(cfg, seed=args.seed)
     collector = DataCollector(sim_collect, expert)
@@ -150,8 +142,7 @@ def main():
     # the expert's action given the same observation.  BCTrainer internally
     # fits a normalizer (mean/std) on the observation data so the network sees
     # zero-mean, unit-variance inputs.  The normalizer is returned and must be
-    # passed to every agent that uses this policy (BC agent, and later the RL
-    # agent which is warm-started from BC weights).
+    # passed to every agent that uses this policy (BC agent).
     print(f"\n[3/5] Training Behavior Cloning ({args.bc_epochs} epochs)...")
     bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2).to(device)
     bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
@@ -177,28 +168,6 @@ def main():
     wm_trainer = WorldModelTrainer(world_model, lr=3e-4, batch_size=64)
     wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                   num_epochs=args.wm_epochs, verbose=True)
-
-    # ---- 5. RL Policy (warm-started from BC) ----
-    # Instead of training RL from scratch (random policy), we deep-copy the
-    # BC policy weights and fine-tune with REINFORCE.  This "warm start"
-    # dramatically improves sample efficiency: the agent already drives
-    # reasonably from step 1, so REINFORCE can focus on improving reward
-    # rather than learning basic driving from zero.
-    #
-    # A separate simulator (sim_rl, with a different seed) is used so that RL
-    # training traffic patterns are independent of the data-collection runs.
-    # The BC normalizer is reused so that observations are preprocessed
-    # identically to how the BC policy was trained.
-    print(f"\n[5/5] Training RL Policy ({args.rl_episodes} episodes, warm-start from BC)...")
-    import copy
-    rl_policy = copy.deepcopy(bc_policy)  # warm-start: copy BC weights
-    sim_rl = Simulator(cfg, seed=args.seed + 1)  # fresh sim with offset seed
-    rl_trainer = RLTrainer(rl_policy, sim_rl, lr=1e-4, gamma=0.99,
-                            entropy_coef=0.005)
-    rl_trainer.obs_normalizer = bc_normalizer  # reuse BC's obs normalization
-    rl_rewards = rl_trainer.train(num_episodes=args.rl_episodes, verbose=True)
-    # Wrap the RL-trained policy in a BCAgent for evaluation (same interface)
-    rl_agent = BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer)
 
     # ---- Build Planners ----
     # Two MPC-style planners that pick the best action sequence via random
@@ -237,7 +206,6 @@ def main():
         "Behavior Cloning": bc_agent,
         "Planner (true model)": planner_true,
         "Planner (learned WM)": planner_learned,
-        "RL (REINFORCE)": rl_agent,
     }
 
     # Evaluation loop -- each agent is run for eval_episodes and scored.

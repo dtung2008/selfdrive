@@ -7,9 +7,9 @@ A modular simulator for learning and comparing self-driving control strategies o
 This project provides:
 
 - A **multi-lane highway simulator** with realistic traffic (IDM car-following, MOBIL lane-changing)
-- Five **driving agents** spanning rule-based, supervised learning, model-predictive control, and reinforcement learning
+- Four **driving agents** spanning rule-based, supervised learning, and model-predictive control
 - An **attention-based world model** (Transformer) that learns to predict traffic dynamics
-- A **training pipeline** for behavior cloning, world model learning, and policy gradient RL
+- A **training pipeline** for behavior cloning and world model learning
 - An **evaluation harness** for side-by-side agent comparison with metrics like collision rate, average speed, and episode completion
 
 ## Agents Compared
@@ -20,7 +20,6 @@ This project provides:
 | **Behavior Cloning (BC)** | Supervised | MLP policy trained to imitate the expert via cross-entropy loss with inverse-frequency class weighting for rare actions. |
 | **Planner (true model)** | MPC | Random-shooting model-predictive control using the real simulator's `clone_state`/`restore_state` for exact rollouts. Evaluates 9 maneuver templates over a configurable horizon. Uses split RNGs for candidate generation vs. tie-breaking. |
 | **Planner (learned WM)** | MPC | Same MPC framework but replaces the simulator with a learned attention-based world model. Runs rollouts entirely in PyTorch for speed. |
-| **RL (REINFORCE)** | Policy gradient | MLP policy trained via REINFORCE with running baseline, advantage whitening, entropy bonus, and gradient clipping. |
 
 ## Traffic Models
 
@@ -95,7 +94,6 @@ selfdrive/
 │   ├── data_collector.py            # Trajectory collection via agent-environment interaction
 │   ├── bc_trainer.py                # Behavior cloning: cross-entropy + class weighting
 │   ├── world_model_trainer.py       # World model: MSE on normalized observation deltas
-│   ├── rl_trainer.py                # REINFORCE with baseline, entropy, grad clipping
 │   └── evaluator.py                 # Multi-agent evaluation with statistical metrics
 ├── utils/                           # Shared types and configuration
 │   ├── types.py                     # Core dataclasses: Action, VehicleState, Observation,
@@ -180,7 +178,6 @@ python run_comparison.py \
   --collect-episodes 50 \      # Expert episodes for training data (default: 50)
   --bc-epochs 200 \             # Behavior cloning training epochs (default: 200)
   --wm-epochs 20 \             # World model training epochs (default: 20)
-  --rl-episodes 300 \          # REINFORCE training episodes (default: 300)
   --eval-episodes 30           # Evaluation episodes per agent (default: 20)
 ```
 
@@ -189,8 +186,7 @@ python run_comparison.py \
 1. **Data Collection** -- Expert agent drives in the simulator, collecting (observation, action) trajectories
 2. **BC Training** -- Train an MLP policy to imitate expert actions via supervised learning
 3. **World Model Training** -- Train the attention world model to predict next observations
-4. **RL Training** -- Train a separate MLP policy via REINFORCE in the live simulator
-5. **Evaluation** -- Run all agents for N episodes, collecting metrics:
+4. **Evaluation** -- Run all agents for N episodes, collecting metrics:
    - Average reward and standard deviation
    - Average speed (m/s)
    - Collision rate
@@ -221,7 +217,6 @@ python record_episodes.py --num-lanes 2 --output replay_data.json
 # Record any agent with enhanced debug data (includes expert comparison)
 python record_debug.py --agent bc --seed 42 --output debug_episode.json
 python record_debug.py --agent planner_wm --wm-epochs 80 --output debug_episode.json
-python record_debug.py --agent rl --rl-episodes 300 --output debug_episode.json
 ```
 
 Then open `debug_viewer.html` in a browser and load the JSON file.
@@ -278,19 +273,18 @@ python debug_planner_decision.py --seed 42 --debug-steps 50,100,150
 
 Average reward across lane configurations (3 seeds each, 300 steps, planners use h=30, r=50):
 
-| Config | Expert | BC | RL | Planner True | Planner WM |
-|-----------|--------|--------|--------|--------------|------------|
-| 1L / 3NPC | 200.4 | 198.9 | 199.3 | 203.5 | 198.9 |
-| 2L / 6NPC | 117.4 | 215.5 | 172.9 | 239.7 | 246.9 |
-| 3L / 9NPC | 281.9 | 204.5 | 178.3 | 244.4 | 231.8 |
-| 4L / 12NPC | 204.9 | 189.6 | 158.9 | 242.2 | 237.5 |
+| Config | Expert | BC | Planner True | Planner WM |
+|-----------|--------|--------|--------------|------------|
+| 1L / 3NPC | 200.4 | 198.9 | 203.5 | 198.9 |
+| 2L / 6NPC | 117.4 | 215.5 | 239.7 | 246.9 |
+| 3L / 9NPC | 281.9 | 204.5 | 244.4 | 231.8 |
+| 4L / 12NPC | 204.9 | 189.6 | 242.2 | 237.5 |
 
 Key observations:
 - **1L**: All agents perform similarly (~200). Simple car-following is well-handled by all.
 - **2L**: Expert is volatile across seeds (33–271) while BC and both planners are consistent. Planner WM slightly outperforms planner true here (247 vs 240).
 - **3L/4L**: Expert excels when its heuristics find good lanes (282–287) but can collapse on hard seeds (46). Planners are the most consistent (~240), while BC plateaus around 200.
 - **BC**: Zero collisions across all configs thanks to the safety override layer, but the MLP can't replicate multi-step lane-change reasoning, capping reward around 200.
-- **RL**: Performs worse than BC in multi-lane settings. REINFORCE fine-tuning with 300 episodes degrades the BC-initialized policy rather than improving it — high variance gradients cause policy drift without learning better strategies.
 - **Planner WM vs True**: Remarkably close despite using a learned model trained for only 20 epochs.
 
 ## Key Design Decisions
@@ -304,13 +298,12 @@ Every module has a clean interface and its own test file. Adding a new agent req
 ### Extensibility
 - **More lanes** -- Change `num_lanes` in config; all modules handle N-lane roads
 - **Continuous actions** -- Modify `Action` class and `VehicleDynamics`; agents and models adapt
-- **Better RL** -- Swap `rl_trainer.py` internals (e.g., PPO); the `Agent` interface stays the same
 - **Richer world model** -- Add recurrence or graph attention to `world_model.py`; planner interface unchanged
 - **New traffic behaviors** -- Subclass `TrafficBehavior` and add to the behavior mix in `TrafficConfig`
 
 ### CUDA Support
 
-All neural network models (PolicyNetwork, AttentionWorldModel) are automatically placed on CUDA when a GPU is available. Both `record_debug.py` and `run_comparison.py` detect the device at startup and pass it through to model creation. Trainers (`BCTrainer`, `WorldModelTrainer`, `RLTrainer`) and inference agents (`BCAgent`, `PlannerLearnedModel`) derive the device from model parameters, so tensors are moved automatically.
+All neural network models (PolicyNetwork, AttentionWorldModel) are automatically placed on CUDA when a GPU is available. Both `record_debug.py` and `run_comparison.py` detect the device at startup and pass it through to model creation. Trainers (`BCTrainer`, `WorldModelTrainer`) and inference agents (`BCAgent`, `PlannerLearnedModel`) derive the device from model parameters, so tensors are moved automatically.
 
 ### Expert Configuration
 

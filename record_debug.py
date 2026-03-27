@@ -20,8 +20,8 @@ The output JSON wraps the frame list with a version tag, full config, training
 metadata (agent_info), and an episode summary.  It is consumed by
 debug_viewer.html for interactive step-through visualisation.
 
-Supports all agent types: expert, bc, rl, planner_true, planner_wm.  Learned
-agents (bc, rl, planner_wm) are trained from scratch each run using expert
+Supports all agent types: expert, bc, planner_true, planner_wm.  Learned
+agents (bc, planner_wm) are trained from scratch each run using expert
 demonstration data, so the output is fully self-contained and reproducible
 given the same seeds.
 
@@ -30,12 +30,10 @@ Usage:
     python record_debug.py --agent bc --seed 0 --num-lanes 2 --bc-epochs 50
     python record_debug.py --agent planner_true --planner-horizon 30
     python record_debug.py --agent planner_wm --wm-epochs 80
-    python record_debug.py --agent rl --rl-episodes 300
 """
 import argparse
 import json
 import sys
-import copy
 sys.path.insert(0, ".")
 
 import numpy as np
@@ -53,7 +51,6 @@ from models.world_model import AttentionWorldModel
 from training.data_collector import DataCollector, trajectories_to_arrays
 from training.bc_trainer import BCTrainer
 from training.world_model_trainer import WorldModelTrainer
-from training.rl_trainer import RLTrainer
 
 
 def make_config(args):
@@ -102,7 +99,7 @@ def build_agent(args, cfg, obs_dim, device=None):
     sim_c = Simulator(cfg, seed=args.train_seed)
     collector = DataCollector(sim_c, expert)
     trajs = collector.collect_episodes(args.collect_episodes)
-    obs_data, act_data, rew_data, nobs_data, done_data = trajectories_to_arrays(trajs)
+    obs_data, act_data, _, nobs_data, _ = trajectories_to_arrays(trajs)
     info["train_transitions"] = len(obs_data)
 
     # --- Behavioural Cloning (BC): supervised learning on expert actions ---
@@ -116,29 +113,6 @@ def build_agent(args, cfg, obs_dim, device=None):
         losses, normalizer = trainer.train(obs_data, act_data, num_epochs=args.bc_epochs, verbose=True)
         info["bc_final_loss"] = losses[-1]
         return BCAgent(policy, deterministic=True, normalizer=normalizer), info
-
-    # --- Reinforcement Learning (RL): BC warm-start then policy gradient ---
-    # Two-phase training pipeline:
-    #   1. Pre-train a policy via BC so it starts from a reasonable baseline.
-    #   2. Fine-tune with REINFORCE (policy gradient) using environment reward,
-    #      reusing the BC observation normalizer for stable inputs.
-    # The final policy is evaluated deterministically through BCAgent.
-    if args.agent == "rl":
-        print(f"Training BC for warm-start ({args.bc_epochs} epochs)...")
-        bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2).to(device)
-        bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
-        bc_trainer.train(obs_data, act_data, num_epochs=args.bc_epochs, verbose=False)
-        bc_normalizer = bc_trainer.normalizer
-
-        print(f"Training RL ({args.rl_episodes} episodes, warm-start)...")
-        rl_policy = copy.deepcopy(bc_policy)
-        sim_rl = Simulator(cfg, seed=args.train_seed + 1)
-        rl_trainer = RLTrainer(rl_policy, sim_rl, lr=1e-4, gamma=0.99, entropy_coef=0.005)
-        # Use BC normalizer instead of building a new one
-        rl_trainer.obs_normalizer = bc_normalizer
-        rewards = rl_trainer.train(num_episodes=args.rl_episodes, verbose=True)
-        info["rl_final_avg_reward"] = float(np.mean(rewards[-50:]))
-        return BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer), info
 
     # --- Planner with true model: random-shooting MPC using the real sim ---
     # Uses the actual simulator as a perfect forward model.  At each step it
@@ -283,7 +257,7 @@ def main():
     # Keeping them separate lets you train once and evaluate on many episodes.
     parser = argparse.ArgumentParser(description="Record debug episode")
     parser.add_argument("--agent", type=str, default="expert",
-                        choices=["expert", "bc", "planner_true", "planner_wm", "rl"])
+                        choices=["expert", "bc", "planner_true", "planner_wm"])
     parser.add_argument("--seed", type=int, default=42, help="Episode seed")
     parser.add_argument("--train-seed", type=int, default=42, help="Training data seed")
     parser.add_argument("--num-lanes", type=int, default=2)
@@ -292,7 +266,6 @@ def main():
     parser.add_argument("--collect-episodes", type=int, default=50)
     parser.add_argument("--bc-epochs", type=int, default=200)
     parser.add_argument("--wm-epochs", type=int, default=20)
-    parser.add_argument("--rl-episodes", type=int, default=300)
     parser.add_argument("--planner-horizon", type=int, default=30)
     parser.add_argument("--planner-wm-horizon", type=int, default=4)
     parser.add_argument("--planner-rollouts", type=int, default=50)

@@ -35,7 +35,6 @@ from models.world_model import AttentionWorldModel
 from training.data_collector import DataCollector, trajectories_to_arrays
 from training.bc_trainer import BCTrainer
 from training.world_model_trainer import WorldModelTrainer
-from training.rl_trainer import RLTrainer
 
 
 def make_config(args):
@@ -80,22 +79,6 @@ def build_agent(args, cfg, obs_dim):
                                            num_epochs=args.bc_epochs, verbose=True)
         info["bc_final_loss"] = losses[-1]
         return BCAgent(policy, deterministic=True, normalizer=normalizer), expert, info
-
-    if args.agent == "rl":
-        print(f"Training BC for warm-start ({args.bc_epochs} epochs)...")
-        bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
-        bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
-        bc_trainer.train(obs_data, act_data, num_epochs=args.bc_epochs, verbose=False)
-        bc_normalizer = bc_trainer.normalizer
-
-        print(f"Training RL ({args.rl_episodes} episodes, warm-start)...")
-        rl_policy = copy.deepcopy(bc_policy)
-        sim_rl = Simulator(cfg, seed=args.train_seed + 1)
-        rl_trainer = RLTrainer(rl_policy, sim_rl, lr=1e-4, gamma=0.99, entropy_coef=0.005)
-        rl_trainer.obs_normalizer = bc_normalizer
-        rewards = rl_trainer.train(num_episodes=args.rl_episodes, verbose=True)
-        info["rl_final_avg_reward"] = float(np.mean(rewards[-50:]))
-        return BCAgent(rl_policy, deterministic=True, normalizer=bc_normalizer), expert, info
 
     if args.agent == "planner_true":
         mc = ModelConfig()
@@ -225,7 +208,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Scan seeds to find and record failure episodes")
     parser.add_argument("--agent", type=str, default="planner_wm",
-                        choices=["expert", "bc", "planner_true", "planner_wm", "rl"])
+                        choices=["expert", "bc", "planner_true", "planner_wm"])
     parser.add_argument("--seeds", "--seed", type=str, default="0-19",
                         help="Seed range to scan (e.g., '0-100', '5,10,15', '42')")
     parser.add_argument("--train-seed", type=int, default=42,
@@ -236,7 +219,6 @@ def main():
     parser.add_argument("--collect-episodes", type=int, default=50)
     parser.add_argument("--bc-epochs", type=int, default=200)
     parser.add_argument("--wm-epochs", type=int, default=20)
-    parser.add_argument("--rl-episodes", type=int, default=300)
     parser.add_argument("--planner-horizon", type=int, default=30)
     parser.add_argument("--planner-wm-horizon", type=int, default=4)
     parser.add_argument("--planner-rollouts", type=int, default=50)
