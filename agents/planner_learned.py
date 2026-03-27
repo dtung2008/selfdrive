@@ -37,7 +37,7 @@ import torch
 from agents.base import Agent
 from models.world_model import AttentionWorldModel
 from utils.types import Action, LongitudinalAction, LateralAction
-from utils.config import ModelConfig, SimConfig, VehicleConfig, RoadConfig
+from utils.config import ModelConfig, SimConfig, VehicleConfig, RoadConfig, ObservationConfig
 
 
 class PlannerLearnedModel(Agent):
@@ -77,6 +77,7 @@ class PlannerLearnedModel(Agent):
                  sim_config: SimConfig = None,
                  vehicle_config: VehicleConfig = None,
                  road_config: RoadConfig = None,
+                 obs_config: ObservationConfig = None,
                  normalizer=None,
                  safety_margin: float = 2.0,
                  seed: int = 42):
@@ -92,6 +93,8 @@ class PlannerLearnedModel(Agent):
                 speed limits). Uses defaults if None.
             road_config: Configuration for road layout (number of lanes,
                 speed limit). Uses defaults if None.
+            obs_config: Observation layout descriptor. If None, the default
+                ObservationConfig is used.
             normalizer: Optional normalizer with transform() and
                 inverse_transform() methods for WM input/output.
             safety_margin: Extra safety margin in meters (currently stored
@@ -103,6 +106,7 @@ class PlannerLearnedModel(Agent):
         self.sc = sim_config or SimConfig()
         self.vc = vehicle_config or VehicleConfig()
         self.rc = road_config or RoadConfig()
+        self.oc = obs_config or ObservationConfig()
         self.normalizer = normalizer
         self.safety_margin = safety_margin
         self.rng = np.random.RandomState(seed)
@@ -178,9 +182,10 @@ class PlannerLearnedModel(Agent):
         horizon = self.horizon
         num_rollouts = self.mc.planner_num_rollouts
         dt = self.sc.dt
+        ef = self.oc.ego_features
+        fpn = self.oc.features_per_neighbor
         obs_dim = len(obs)
-        # Number of NPC vehicles: each has 4 fields in the observation
-        k = (obs_dim - 3) // 4
+        k = self.oc.k_neighbors
         num_lanes = self.rc.num_lanes
 
         # --- Generate candidate action sequences ---
@@ -210,11 +215,11 @@ class PlannerLearnedModel(Agent):
         npc_lane = np.zeros((num_rollouts, k))
         npc_exists = np.zeros((num_rollouts, k))
         for ni in range(k):
-            base = 3 + ni * 4
+            base = ef + ni * fpn
             rel_x = obs[base]
             rel_lane = obs[base + 1]
             rel_speed = obs[base + 2]
-            exists = obs[base + 3]
+            exists = obs[base + fpn - 1]
             # Broadcast initial NPC state across all rollouts (all start
             # from the same observation)
             npc_abs_x[:, ni] = ego_x_init + rel_x
@@ -299,13 +304,13 @@ class PlannerLearnedModel(Agent):
                 obs_for_wm[:, 1] = prev_lanes
                 obs_for_wm[:, 2] = prev_xs
                 for ni in range(k):
-                    base = 3 + ni * 4
+                    base = ef + ni * fpn
                     # Recompute relative positions from absolute NPC state
                     # and pre-action ego state
                     obs_for_wm[:, base] = npc_abs_x[:, ni] - prev_xs       # rel_x
                     obs_for_wm[:, base + 1] = npc_lane[:, ni] - prev_lanes  # rel_lane
                     obs_for_wm[:, base + 2] = npc_abs_speed[:, ni] - prev_speeds  # rel_speed
-                    obs_for_wm[:, base + 3] = npc_exists[:, ni]
+                    obs_for_wm[:, base + fpn - 1] = npc_exists[:, ni]
 
                 # --- Step 3: Run the world model ---
                 # Normalize input, run WM inference, denormalize output
@@ -337,7 +342,7 @@ class PlannerLearnedModel(Agent):
                 ego_delta_speed = ego_speeds - prev_speeds
 
                 for ni in range(k):
-                    base = 3 + ni * 4
+                    base = ef + ni * fpn
                     # WM-predicted next relative position and speed
                     pred_rel_x = pred_real[:, base]
                     pred_rel_speed = pred_real[:, base + 2]
@@ -517,9 +522,12 @@ class PlannerLearnedModel(Agent):
         Returns:
             The (possibly overridden) Action. Returned unchanged if safe.
         """
+        ef = self.oc.ego_features
+        fpn = self.oc.features_per_neighbor
+        k = self.oc.k_neighbors
+
         ego_speed = obs[0]
         ego_lane = int(round(obs[1]))
-        k = (len(obs) - 3) // 4
         lateral = action.lateral.value
         target_lane = ego_lane + lateral
 
@@ -533,11 +541,11 @@ class PlannerLearnedModel(Agent):
         closing_speed_target = 0.0        # closing speed to nearest target-lane NPC ahead
 
         for i in range(k):
-            base = 3 + i * 4
+            base = ef + i * fpn
             rel_x = obs[base]
             rel_lane = obs[base + 1]
             rel_speed = obs[base + 2]     # npc_speed - ego_speed (negative = closing)
-            exists = obs[base + 3]
+            exists = obs[base + fpn - 1]
             if exists < 0.5:
                 continue
             npc_lane = ego_lane + rel_lane

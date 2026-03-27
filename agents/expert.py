@@ -8,15 +8,19 @@ can later learn to reproduce via behavioural cloning.
 High-level strategy
 -------------------
 1. **Longitudinal control** -- Maintain a safe following distance behind the
-   lead vehicle using logic inspired by the Intelligent Driver Model (IDM).
+   lead vehicle using physics-based stopping distance (IDM-inspired).
+   Anticipate braking cascades from the 2nd leader's acceleration.
    Accelerate toward a desired cruise speed when the road ahead is clear;
    decelerate when the gap to the leader becomes unsafe.
 2. **Lane-change decisions** -- Attempt to overtake a slow leader by
    switching to an adjacent lane when there is a sufficient gap both ahead
    and behind in the target lane.  An *emergency* mode relaxes the gap
    thresholds when the ego vehicle is critically close to the leader.
-3. **Lane preference** -- When neither passing nor emergency conditions
-   apply, the agent holds its current lane (no gratuitous weaving).
+   Uses continuous urgency scoring rather than a binary motivation gate.
+3. **Lane preference** -- When urgency is low, the agent holds its current
+   lane (no gratuitous weaving).
+4. **Same-lane behind awareness** -- A fast approaching tailgater adds
+   urgency to lane-change decisions.
 
 A cooldown mechanism prevents rapid back-and-forth lane oscillations.
 """
@@ -24,329 +28,367 @@ A cooldown mechanism prevents rapid back-and-forth lane oscillations.
 import numpy as np
 from agents.base import Agent
 from utils.types import Action, LongitudinalAction, LateralAction, Observation
-from utils.config import ObservationConfig
+from utils.config import ObservationConfig, ExpertConfig
 
 
 class ExpertAgent(Agent):
-    """Deterministic rule-based expert driver.
+    """Deterministic rule-based expert driver with acceleration awareness.
 
     The agent reads a flat observation vector produced by the simulator,
-    parses it into ego state and neighbor information, then applies a
-    hierarchy of simple rules to decide on a longitudinal and lateral
-    action each time step.
+    parses it into ego state and neighbor information (including
+    acceleration), then applies a hierarchy of rules to decide on a
+    longitudinal and lateral action each time step.
 
-    Attributes:
-        obs_config: Defines the observation layout (number of neighbours, etc.).
-        safe_distance: Minimum acceptable gap (metres) to the lead vehicle
-            before the agent begins to decelerate.
-        desired_speed: Target cruise speed (m/s) on an open road.
-        lane_change_gap: Minimum forward gap (metres) required in an adjacent
-            lane before a lane change is considered safe.
-        num_lanes: Total number of lanes on the highway (used to clamp
-            lane-change candidates to valid indices).
+    Key improvements over a naive rule-based driver:
+    - Physics-based stopping distance accounts for closing speed.
+    - Cascade braking: anticipates 1st leader braking by observing 2nd
+      leader's deceleration.
+    - Stable gap: allows acceleration when leader is pulling away.
+    - Same-lane behind awareness: tailgater pressure adds lane-change urgency.
+    - Continuous urgency replaces binary motivation gate.
     """
 
     def __init__(self, obs_config: ObservationConfig = None,
-                 safe_distance: float = 20.0,
-                 desired_speed: float = 30.0,
-                 lane_change_gap: float = 15.0,
-                 num_lanes: int = 2):
-        """Initialise the expert agent with driving parameters.
-
-        Args:
-            obs_config: Observation layout descriptor.  If ``None``, the
-                default :class:`ObservationConfig` is used.
-            safe_distance: Desired gap (m) behind a lead vehicle.
-            desired_speed: Cruise-speed target (m/s).
-            lane_change_gap: Minimum forward gap (m) in the target lane to
-                consider a lane change safe under normal conditions.
-            num_lanes: Number of lanes on the road.
-        """
+                 expert_config: ExpertConfig = None,
+                 num_lanes: int = 2,
+                 # Legacy kwargs for backward compatibility
+                 safe_distance: float = None,
+                 desired_speed: float = None,
+                 lane_change_gap: float = None):
         self.obs_config = obs_config or ObservationConfig()
-        self.safe_distance = safe_distance
-        self.desired_speed = desired_speed
-        self.lane_change_gap = lane_change_gap
+        self.ec = expert_config or ExpertConfig()
         self.num_lanes = num_lanes
+
+        # Legacy overrides
+        if safe_distance is not None:
+            self.ec.safe_distance = safe_distance
+        if desired_speed is not None:
+            self.ec.desired_speed = desired_speed
+        if lane_change_gap is not None:
+            self.ec.lane_change_gap = lane_change_gap
+
+        # Convenience aliases
+        self.safe_distance = self.ec.safe_distance
+        self.desired_speed = self.ec.desired_speed
+        self.lane_change_gap = self.ec.lane_change_gap
 
         # Episode-level bookkeeping
         self._step_count = 0
-        # Initialised to -100 so that the very first lane change is never
-        # blocked by the cooldown check (step_count starts at 0).
         self._last_lane_change_step = -100
-        # Minimum number of steps between consecutive lane changes to
-        # prevent rapid oscillation.
-        self._lane_change_cooldown = 10
+        self._lane_change_cooldown = self.ec.lane_change_cooldown
+        self._stuck_counter = 0
 
     def reset(self):
-        """Reset episode-level state for a new driving episode.
-
-        Re-initialises the step counter and lane-change cooldown tracker so
-        that stale state from a previous episode does not affect decisions.
-        """
+        """Reset episode-level state for a new driving episode."""
         self._step_count = 0
-        # -100 ensures the cooldown window is already expired at step 0.
         self._last_lane_change_step = -100
+        self._stuck_counter = 0
 
     def act(self, obs: np.ndarray) -> Action:
-        """Parse the observation vector and decide on a driving action.
-
-        The decision pipeline is:
-        1. Parse the flat observation into structured ego + neighbour data.
-        2. Identify the lead vehicle in the current lane.
-        3. Compute a longitudinal action (accel / decel / keep).
-        4. Compute a lateral action (lane-left / lane-right / keep).
-        5. Apply a cooldown filter to suppress rapid lane oscillation.
-
-        Args:
-            obs: Flat 1-D observation array from the simulator.
-
-        Returns:
-            An :class:`Action` with longitudinal and lateral components.
-        """
+        """Parse the observation vector and decide on a driving action."""
         self._step_count += 1
         parsed = self._parse_obs(obs)
         ego_speed = parsed["ego_speed"]
         ego_lane = parsed["ego_lane"]
-        # Each neighbour dict has keys: rel_x, rel_lane, rel_speed
         neighbors = parsed["neighbors"]
 
-        # --- Step 2: identify the closest vehicle ahead in the same lane ---
+        # Track consecutive stuck steps for urgency escalation
+        if ego_speed < self.desired_speed - self.ec.stuck_speed_deficit:
+            self._stuck_counter += 1
+        else:
+            self._stuck_counter = 0
+
+        # Identify same-lane vehicles
         leader = self._find_closest_ahead(neighbors, lane_offset=0)
+        second_leader = self._find_second_ahead(neighbors, lane_offset=0)
+        follower = self._find_closest_behind(neighbors, lane_offset=0)
 
-        # --- Step 3: longitudinal (speed) decision ---
-        lon = self._longitudinal_decision(ego_speed, leader)
+        # Longitudinal decision (now cascade-aware)
+        lon = self._longitudinal_decision(ego_speed, leader, second_leader)
 
-        # --- Step 4: lateral (lane-change) decision ---
-        lat = self._lateral_decision(ego_speed, ego_lane, leader, neighbors)
+        # Lateral decision (now with urgency scoring and behind-awareness)
+        lat = self._lateral_decision(ego_speed, ego_lane, leader,
+                                     follower, neighbors)
 
-        # --- Step 5: cooldown gate ---
-        # If a lane change was chosen, suppress it when we changed lanes too
-        # recently.  This prevents the agent from ping-ponging between lanes
-        # on successive time steps.
+        # Cooldown gate
         if lat != LateralAction.KEEP:
             steps_since = self._step_count - self._last_lane_change_step
             if steps_since < self._lane_change_cooldown:
                 lat = LateralAction.KEEP
             else:
-                # Commit to the lane change and record the timestamp.
                 self._last_lane_change_step = self._step_count
 
         return Action(longitudinal=lon, lateral=lat)
 
+    # ------------------------------------------------------------------
+    # Observation parsing
+    # ------------------------------------------------------------------
+
     def _parse_obs(self, obs: np.ndarray) -> dict:
-        """Decode the flat observation vector into structured ego and neighbour data.
+        """Decode the flat observation vector into structured data.
 
-        The observation layout (defined by ``obs_config``) is::
-
-            [ego_speed, ego_lane, ego_x,
-             n0_rel_x, n0_rel_lane, n0_rel_speed, n0_exists,
-             n1_rel_x, n1_rel_lane, n1_rel_speed, n1_exists,
-             ...]
-
-        Args:
-            obs: Flat 1-D array from the simulator.
-
-        Returns:
-            A dict with keys ``ego_speed`` (float), ``ego_lane`` (int),
-            ``ego_x`` (float), and ``neighbors`` (list of dicts, each with
-            ``rel_x``, ``rel_lane``, ``rel_speed``).  Only neighbours whose
-            *exists* flag is set are included.
+        Now extracts ego_accel and per-neighbor rel_accel in addition to
+        the original fields.
         """
+        ef = self.obs_config.ego_features
+        fpn = self.obs_config.features_per_neighbor
+
         ego_speed = obs[0]
-        # Lane index may be a float due to interpolation; snap to nearest int.
         ego_lane = int(round(obs[1]))
         ego_x = obs[2]
+        ego_accel = obs[3] if ef >= 4 else 0.0
 
         k = self.obs_config.k_neighbors
-        # Reshape the trailing portion into (k, 4) -- one row per neighbour
-        # slot.  Columns: [rel_x, rel_lane, rel_speed, exists_flag].
-        raw = obs[3:].reshape(k, 4)
+        raw = obs[ef:].reshape(k, fpn)
 
         neighbors = []
         for i in range(k):
-            # The exists flag is 1.0 when the slot is occupied and 0.0 when
-            # it is padding.  Using 0.5 as a threshold for robustness.
-            if raw[i, 3] > 0.5:
-                neighbors.append({
+            if raw[i, fpn - 1] > 0.5:
+                n = {
                     "rel_x": raw[i, 0],
                     "rel_lane": int(round(raw[i, 1])),
                     "rel_speed": raw[i, 2],
-                })
+                }
+                # rel_accel is at index 3 when fpn >= 5
+                if fpn >= 5:
+                    n["rel_accel"] = raw[i, 3]
+                else:
+                    n["rel_accel"] = 0.0
+                neighbors.append(n)
         return {"ego_speed": ego_speed, "ego_lane": ego_lane,
-                "ego_x": ego_x, "neighbors": neighbors}
+                "ego_x": ego_x, "ego_accel": ego_accel,
+                "neighbors": neighbors}
+
+    # ------------------------------------------------------------------
+    # Neighbor lookups
+    # ------------------------------------------------------------------
 
     def _find_closest_ahead(self, neighbors, lane_offset=0):
-        """Find the nearest vehicle ahead of the ego car in a given lane.
-
-        ``lane_offset`` is relative to the ego vehicle's current lane:
-        0 = same lane, -1 = one lane to the left, +1 = one lane to the right.
-
-        Args:
-            neighbors: List of neighbour dicts (from :meth:`_parse_obs`).
-            lane_offset: Relative lane index to search in.
-
-        Returns:
-            The neighbour dict with the smallest positive ``rel_x`` in the
-            target lane, or ``None`` if no such vehicle exists.
-        """
-        # rel_x > 0 means the neighbour is ahead of the ego vehicle.
+        """Find the nearest vehicle ahead in the given lane."""
         ahead = [n for n in neighbors
                  if n["rel_lane"] == lane_offset and n["rel_x"] > 0]
         if not ahead:
             return None
         return min(ahead, key=lambda n: n["rel_x"])
 
-    def _find_closest_behind(self, neighbors, lane_offset=0):
-        """Find the nearest vehicle behind the ego car in a given lane.
+    def _find_second_ahead(self, neighbors, lane_offset=0):
+        """Find the second-nearest vehicle ahead in the given lane.
 
-        Args:
-            neighbors: List of neighbour dicts (from :meth:`_parse_obs`).
-            lane_offset: Relative lane index to search in.
-
-        Returns:
-            The neighbour dict with the largest (least negative) ``rel_x``
-            in the target lane, or ``None`` if no such vehicle exists.
+        Used for cascade braking detection: if the 2nd leader is braking,
+        the 1st leader will soon brake too.
         """
-        # rel_x < 0 means the neighbour is behind the ego vehicle.
+        ahead = sorted(
+            [n for n in neighbors
+             if n["rel_lane"] == lane_offset and n["rel_x"] > 0],
+            key=lambda n: n["rel_x"])
+        if len(ahead) >= 2:
+            return ahead[1]
+        return None
+
+    def _find_closest_behind(self, neighbors, lane_offset=0):
+        """Find the nearest vehicle behind in the given lane."""
         behind = [n for n in neighbors
                   if n["rel_lane"] == lane_offset and n["rel_x"] < 0]
         if not behind:
             return None
-        # max() picks the value closest to zero (i.e. the nearest follower).
         return max(behind, key=lambda n: n["rel_x"])
 
-    def _longitudinal_decision(self, ego_speed, leader) -> LongitudinalAction:
+    # ------------------------------------------------------------------
+    # Longitudinal decision
+    # ------------------------------------------------------------------
+
+    def _longitudinal_decision(self, ego_speed, leader,
+                               second_leader=None) -> LongitudinalAction:
         """Decide whether to accelerate, decelerate, or maintain speed.
 
-        The logic follows a simplified Intelligent Driver Model (IDM) with
-        physics-based stopping distance:
-
-        * If a leader exists and the gap is below the *effective* safe
-          distance (which accounts for closing speed), decelerate. The
-          effective distance is ``max(safe_distance, stopping_distance)``
-          where ``stopping_distance = v_closing² / (2 * max_decel) + 5m``.
-        * If a leader exists within ``safe_distance`` but is not approaching,
-          hold speed (gap is small but stable).
-        * Otherwise, accelerate toward ``desired_speed`` with a small
-          deadband ([-0.5, +2.0] m/s) to avoid chattering.
-
-        Args:
-            ego_speed: Current speed of the ego vehicle (m/s).
-            leader: Closest-ahead neighbour dict, or ``None`` if the lane
-                is clear.
-
-        Returns:
-            A :class:`LongitudinalAction` enum value.
+        Improvements over basic IDM:
+        1. Cascade braking: if the 2nd leader is braking hard, preemptively
+           decelerate even if the 1st leader hasn't reacted yet.
+        2. Stable gap with leader pulling away: if gap < safe_distance but
+           leader is accelerating away (rel_accel > 0), allow acceleration
+           instead of forcing KEEP.
         """
+        ec = self.ec
+
         if leader is not None:
             gap = leader["rel_x"]
-            # Physics-based safe distance: when closing on a slower leader,
-            # account for the kinematic stopping distance needed to match
-            # speeds. Two components (take the max):
-            #   1. Base safe_distance (20m default)
-            #   2. Stopping distance: v_closing² / (2 * max_decel) + buffer
-            # The stopping distance term prevents late-braking collisions
-            # when approaching a much slower vehicle at high speed (e.g.,
-            # ego at 30 m/s, leader at 17 m/s → need ~22m to stop safely).
             closing_speed = max(-leader["rel_speed"], 0.0)
-            max_decel = 5.0  # VehicleConfig.max_deceleration
-            # Buffer of 10m covers vehicle length (4.5m), discrete timestep
-            # quantization error (~0.6m), and safety margin.
-            stopping_dist = (closing_speed ** 2) / (2 * max_decel) + 10.0
+            stopping_dist = (closing_speed ** 2) / (2 * ec.max_decel) + ec.stopping_buffer
             effective_safe = max(self.safe_distance, stopping_dist)
 
-            if gap < effective_safe and leader["rel_speed"] < 0:
-                # Closing and within the safety envelope -- brake.
+            # Cascade braking: 2nd leader decelerating hard means 1st
+            # leader will brake soon. Act preemptively.
+            cascade_threat = False
+            if second_leader is not None:
+                gap_between = second_leader["rel_x"] - gap
+                if (gap_between < ec.cascade_max_gap
+                        and second_leader.get("rel_accel", 0.0) < ec.cascade_accel_threshold):
+                    # 2nd leader is braking hard — increase effective safe
+                    # distance to give more reaction time
+                    cascade_threat = True
+                    effective_safe = max(effective_safe, self.safe_distance * 1.5)
+
+            # State 1 - CLOSING: gap below safe envelope and closing fast
+            if gap < effective_safe and (leader["rel_speed"] < -ec.match_speed_deadband or cascade_threat):
                 return LongitudinalAction.DECELERATE
-            if gap < self.safe_distance and leader["rel_speed"] >= 0:
-                # Gap is small but not closing -- coast to keep it stable.
+
+            # State 2 - STABLE GAP: gap < safe_distance, not closing fast
+            if gap < self.safe_distance and leader["rel_speed"] >= -ec.match_speed_deadband:
+                # Critical gap: still closing even slowly — brake to prevent
+                # slow-drift collisions
+                if gap < ec.critical_gap and closing_speed > 0:
+                    return LongitudinalAction.DECELERATE
+                # If leader is accelerating away (gap opening fast),
+                # allow ego to accelerate too instead of being stuck
+                leader_accel = leader.get("rel_accel", 0.0)
+                if leader_accel > 1.0 and ego_speed < self.desired_speed - ec.speed_deadband_low:
+                    return LongitudinalAction.ACCELERATE
                 return LongitudinalAction.KEEP
 
-        if ego_speed < self.desired_speed - 0.5:
-            # Open road and below cruise speed -- speed up.
+        # Cruise control
+        if ego_speed < self.desired_speed - ec.speed_deadband_low:
             return LongitudinalAction.ACCELERATE
-        elif ego_speed > self.desired_speed + 2.0:
-            # Slightly above desired speed (asymmetric deadband accounts for
-            # the fact that overshooting is less critical than undershooting).
+        elif ego_speed > self.desired_speed + ec.speed_deadband_high:
             return LongitudinalAction.DECELERATE
         else:
-            # Within the deadband -- maintain current speed.
             return LongitudinalAction.KEEP
 
+    # ------------------------------------------------------------------
+    # Lateral decision
+    # ------------------------------------------------------------------
+
     def _lateral_decision(self, ego_speed, ego_lane, leader,
-                          neighbors) -> LateralAction:
-        """Decide whether to change lanes (and which direction).
+                          follower, neighbors) -> LateralAction:
+        """Decide whether to change lanes using continuous urgency scoring.
 
-        The method first checks whether there is a *reason* to change lanes
-        (a slow or blocking leader), then evaluates whether either adjacent
-        lane offers a safe and meaningfully better gap.
+        Replaces the binary should_pass gate with a continuous urgency
+        score that considers:
+        - Closing speed to leader (leader blocking)
+        - Speed deficit (stuck behind slow traffic)
+        - Leader's deceleration (anticipatory)
+        - Tailgater pressure from behind
 
-        Two independent triggers can motivate a lane change:
-
-        * **leader_blocking** -- the lead vehicle is within 1.5x the safe
-          distance and closing at > 2 m/s.  This is the "active approach"
-          trigger.
-        * **stuck_behind** -- the ego speed has dropped more than 5 m/s
-          below ``desired_speed`` while a leader is within 1.5x safe
-          distance.  This catches the case where the ego has already matched
-          a slow leader's speed and the relative speed is near zero.
-
-        An *emergency* flag is raised when the gap is critically small
-        (< 0.5 * ego_speed) or the ego is stuck with the leader inside the
-        safe distance.  Emergency mode relaxes the gap requirements in the
-        target lane so the agent can escape a dangerous situation.
-
-        Args:
-            ego_speed: Current ego speed (m/s).
-            ego_lane: Current ego lane index.
-            leader: Closest-ahead neighbour dict (or ``None``).
-            neighbors: Full list of neighbour dicts.
-
-        Returns:
-            A :class:`LateralAction` -- LEFT, RIGHT, or KEEP.
+        Higher urgency lowers the min_improvement threshold, making lane
+        changes easier to justify when the situation is more pressing.
         """
-        # --- Determine motivation to change lanes ---
-        leader_blocking = (leader is not None
-                           and leader["rel_x"] < self.safe_distance * 1.5
-                           and leader["rel_speed"] < -2.0)
-        stuck_behind = (leader is not None
-                        and leader["rel_x"] < self.safe_distance * 1.5
-                        and ego_speed < self.desired_speed - 5.0)
-        should_pass = leader_blocking or stuck_behind
+        ec = self.ec
 
-        if not should_pass:
-            # No motivation to leave the current lane.
+        if leader is None:
+            # Check if a fast tailgater is approaching — might want to
+            # move over to let them pass, but only if urgency is high
+            if follower is not None:
+                closing_behind = max(follower["rel_speed"], 0.0)
+                if closing_behind > 5.0 and abs(follower["rel_x"]) < 15.0:
+                    # Fast approach from behind — consider moving over
+                    pass  # handled by urgency below
+                else:
+                    return LateralAction.KEEP
+            else:
+                return LateralAction.KEEP
+
+        # --- Compute continuous urgency ---
+        urgency = 0.0
+        leader_range = self.safe_distance * ec.leader_range_factor
+
+        # Proactive component: closing on leader — will need to brake soon
+        if leader is not None and leader["rel_speed"] < 0:
+            closing = -leader["rel_speed"]
+            time_to_safe = (leader["rel_x"] - self.safe_distance) / max(closing, 0.1)
+            if time_to_safe < ec.proactive_lane_change_time:
+                urgency += (ec.proactive_lane_change_time - time_to_safe) / ec.proactive_lane_change_time
+
+        if leader is not None and leader["rel_x"] < leader_range:
+            # Blocking component: closing on leader
+            if leader["rel_speed"] < -ec.closing_speed_threshold:
+                urgency += (-leader["rel_speed"] - ec.closing_speed_threshold) / 10.0
+
+            # Stuck component: ego well below desired speed
+            if ego_speed < self.desired_speed - ec.stuck_speed_deficit:
+                urgency += (self.desired_speed - ec.stuck_speed_deficit - ego_speed) / 10.0
+
+            # Anticipatory component: leader is decelerating
+            leader_accel = leader.get("rel_accel", 0.0)
+            if leader_accel < 0:
+                urgency += abs(leader_accel) / 5.0
+
+        # Tailgater pressure: fast car closing from behind
+        if follower is not None:
+            closing_behind = max(follower["rel_speed"], 0.0)
+            behind_gap = abs(follower["rel_x"])
+            if closing_behind > 3.0 and behind_gap < 20.0:
+                urgency += closing_behind / 20.0
+
+        if urgency < 0.1:
             return LateralAction.KEEP
 
         # --- Determine emergency level ---
-        # Speed-proportional safe following distance (clamped to 5 m at low
-        # speeds to avoid near-zero thresholds).
-        safe_following = ego_speed * 0.5 if ego_speed > 10 else 5.0
+        safe_following = max(5.0, ego_speed * 0.5)
+        stuck_behind = (leader is not None
+                        and leader["rel_x"] < leader_range
+                        and ego_speed < self.desired_speed - ec.stuck_speed_deficit)
         emergency = (leader is not None and
                      (leader["rel_x"] < safe_following or
                       (stuck_behind and leader["rel_x"] < self.safe_distance)))
 
+        # --- Urgency escalation from being stuck many steps ---
+        urgency_escalation = min(
+            self._stuck_counter / ec.urgency_escalation_steps,
+            ec.max_urgency_escalation)
+
         # --- Evaluate candidate lanes ---
         import random
-        current_gap = leader["rel_x"] if leader else float('inf')
-        # Require a meaningful improvement so that the agent does not change
-        # lanes for marginal benefit (e.g. 22 m vs. 20 m ahead).
-        min_improvement = 10.0
+        if leader is not None:
+            raw_current = leader["rel_x"]
+            current_projected = raw_current + leader["rel_speed"] * ec.gap_projection_time
+            current_gap = max(current_projected, 0.0)
+        else:
+            current_gap = float('inf')
+        min_improvement = ec.min_improvement
 
         directions = [(-1, LateralAction.LEFT), (1, LateralAction.RIGHT)]
-        safe_options = []  # list of (forward_gap, LateralAction)
+        safe_options = []
         for direction, lat_action in directions:
             target_lane = ego_lane + direction
-            # Clamp to valid lane indices.
             if target_lane < 0 or target_lane >= self.num_lanes:
                 continue
-            if self._lane_is_safe(neighbors, direction, emergency=emergency):
-                # Measure the forward gap in the candidate lane.
+            if self._lane_is_safe(neighbors, direction, emergency=emergency,
+                                   urgency_escalation=urgency_escalation):
                 ahead = self._find_closest_ahead(neighbors, direction)
-                gap = ahead["rel_x"] if ahead else float('inf')
-                # Only worth changing if the target lane is *substantially*
-                # better than the current lane.
-                if gap > current_gap + min_improvement:
+                if ahead is not None:
+                    raw_gap = ahead["rel_x"]
+                    # Project gap forward to penalize fast-closing targets
+                    projected_gap = raw_gap + ahead["rel_speed"] * ec.gap_projection_time
+                    gap = max(projected_gap, 0.0)
+                else:
+                    gap = float('inf')
+
+                # Check if the target lane is flowing well
+                second = self._find_second_ahead(neighbors, direction)
+                lane_flowing = True
+                if (second is not None and ahead is not None
+                        and second["rel_x"] - ahead["rel_x"] < ec.cascade_max_gap
+                        and second.get("rel_accel", 0.0) < ec.cascade_accel_threshold):
+                    lane_flowing = False  # target lane is congesting
+
+
+                # Two-step lookahead: if the lane beyond the target is
+                # much better, credit that to this intermediate move.
+                # This lets the expert use L1 as a stepping stone to L0.
+                second_lane = target_lane + direction
+                if 0 <= second_lane < self.num_lanes:
+                    far_ahead = self._find_closest_ahead(neighbors, direction * 2)
+                    if far_ahead is not None:
+                        far_proj = far_ahead["rel_x"] + far_ahead["rel_speed"] * ec.gap_projection_time
+                        far_gap = max(far_proj, 0.0)
+                    else:
+                        far_gap = float('inf')
+                    # Blend: effective = target_gap + factor * max(far_gap - target_gap, 0)
+                    # Guard: inf - inf = nan which poisons comparisons
+                    if gap < float('inf') and far_gap > gap:
+                        bonus = (far_gap - gap) * ec.two_step_lookahead_factor
+                        gap += bonus
+
+                if gap > current_gap + min_improvement and lane_flowing:
                     safe_options.append((gap, lat_action))
 
         # --- Select among candidates ---
@@ -355,61 +397,59 @@ class ExpertAgent(Agent):
         if len(safe_options) == 1:
             return safe_options[0][1]
 
-        # Both directions are viable -- prefer the one with more room.
+        # Both directions viable — prefer the one with more room
         if abs(safe_options[0][0] - safe_options[1][0]) > 5.0:
             return max(safe_options, key=lambda x: x[0])[1]
-        # Gaps are roughly equal -- break the tie randomly to avoid a
-        # systematic left/right bias.
         return random.choice(safe_options)[1]
 
-    def _lane_is_safe(self, neighbors, lane_offset, emergency=False) -> bool:
-        """Determine whether there is a sufficient gap in an adjacent lane.
+    # ------------------------------------------------------------------
+    # Lane safety check
+    # ------------------------------------------------------------------
 
-        Two gap checks are performed -- one for the nearest vehicle *ahead*
-        and one for the nearest vehicle *behind* in the target lane.  Both
-        must exceed their respective thresholds for the lane to be deemed
-        safe.
+    def _lane_is_safe(self, neighbors, lane_offset, emergency=False,
+                      urgency_escalation=0.0) -> bool:
+        """Check if the target lane has sufficient gaps for merging.
 
-        Operating modes:
-            * **Normal** (``emergency=False``): conservative thresholds
-              (ahead >= 20 m, behind >= 15 m) to ensure comfortable merging.
-            * **Emergency** (``emergency=True``): relaxed thresholds
-              (ahead >= 10 m, behind >= 5 m) to allow escape from a
-              dangerously small gap in the current lane.
+        Uses physics-based stopping distance for the ahead gap when closing
+        on a target-lane vehicle, and accounts for the target-lane vehicle's
+        acceleration to avoid merging into a decelerating gap.
 
-        Args:
-            neighbors: List of neighbour dicts.
-            lane_offset: Relative lane to check (-1 for left, +1 for right).
-            emergency: If ``True``, apply relaxed gap thresholds.
-
-        Returns:
-            ``True`` if both the forward and rearward gaps meet the
-            required minimums; ``False`` otherwise.
+        urgency_escalation (0..max_urgency_escalation) relaxes gap thresholds
+        when the ego has been stuck behind slow traffic for many steps.
         """
+        ec = self.ec
         if emergency:
-            min_gap_ahead = 10.0
-            min_gap_behind = 5.0
+            min_gap_ahead = ec.emergency_gap_ahead
+            min_gap_behind = ec.emergency_gap_behind
         else:
-            # Use at least 20 m even if lane_change_gap was set lower,
-            # to guarantee a safe merge under normal conditions.
-            min_gap_ahead = max(self.lane_change_gap, 20.0)
-            min_gap_behind = 15.0
+            min_gap_ahead = max(self.lane_change_gap, ec.normal_min_gap_ahead)
+            min_gap_behind = ec.normal_min_gap_behind
+
+        # Relax ahead threshold when stuck for many consecutive steps.
+        # Behind gap is a safety constraint (can't control the follower),
+        # so it is never reduced by urgency.
+        if urgency_escalation > 0:
+            reduction = 1.0 - urgency_escalation
+            min_gap_ahead *= reduction
 
         ahead = self._find_closest_ahead(neighbors, lane_offset)
         behind = self._find_closest_behind(neighbors, lane_offset)
 
-        # Reject if there is a vehicle ahead in the target lane that is
-        # too close. Use physics-based stopping distance when closing on
-        # the target-lane NPC to avoid merging into a shrinking gap.
         if ahead is not None:
             closing_speed = max(-ahead["rel_speed"], 0.0)
-            max_decel = 5.0  # VehicleConfig.max_deceleration
-            stopping_dist = (closing_speed ** 2) / (2 * max_decel) + 10.0
+            stopping_dist = (closing_speed ** 2) / (2 * ec.max_decel) + ec.stopping_buffer
             effective_ahead = max(min_gap_ahead, stopping_dist)
+
+            # If the target-lane vehicle ahead is decelerating, the gap
+            # will close faster than current closing speed suggests —
+            # add extra margin
+            ahead_accel = ahead.get("rel_accel", 0.0)
+            if ahead_accel < -1.0:
+                effective_ahead += abs(ahead_accel) * 2.0
+
             if ahead["rel_x"] < effective_ahead:
                 return False
-        # Reject if there is a vehicle behind in the target lane that is
-        # too close.  abs() is used because rel_x is negative for followers.
+
         if behind is not None and abs(behind["rel_x"]) < min_gap_behind:
             return False
         return True

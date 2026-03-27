@@ -93,9 +93,8 @@ def main():
 
     cfg = make_simple_config()
 
-    # obs_dim = 3 ego features (speed, lane, x) + k_neighbors * 4 neighbor
-    # features (rel_x, rel_y, rel_speed, lane_offset) = 3 + 4*4 = 19.
-    obs_dim = 3 + cfg.obs.k_neighbors * 4  # 19
+    # obs_dim = ego_features + k_neighbors * features_per_neighbor
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
 
     mc = ModelConfig()
     mc.planner_horizon = args.planner_horizon
@@ -178,7 +177,9 @@ def main():
     world_model = AttentionWorldModel(
         embed_dim=mc.wm_embed_dim, num_heads=mc.wm_num_heads,
         num_layers=mc.wm_num_layers,
-        max_vehicles=cfg.obs.k_neighbors + 1, num_actions=9)
+        max_vehicles=cfg.obs.k_neighbors + 1, num_actions=9,
+        ego_features=cfg.obs.ego_features,
+        features_per_neighbor=cfg.obs.features_per_neighbor)
     wm_trainer = WorldModelTrainer(world_model, lr=3e-4, batch_size=64)
     wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                   num_epochs=args.wm_epochs, verbose=True)
@@ -265,7 +266,8 @@ def main():
     planner_learned = PlannerLearnedModel(
         world_model, mc, cfg.sim, cfg.vehicle,
         road_config=cfg.road,
-        normalizer=wm_trainer.normalizer, seed=args.seed)
+        normalizer=wm_trainer.normalizer,
+        obs_config=cfg.obs, seed=args.seed)
 
     # ---- Evaluate ----
     # Run every agent for eval_episodes and report collision rate, avg reward,

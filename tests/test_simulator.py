@@ -19,7 +19,8 @@ class TestSimulator:
         obs = self.sim.reset()
         assert isinstance(obs, np.ndarray)
         assert obs.ndim == 1
-        expected_size = 3 + self.sim.config.obs.k_neighbors * 4
+        oc = self.sim.config.obs
+        expected_size = oc.ego_features + oc.k_neighbors * oc.features_per_neighbor
         assert obs.shape[0] == expected_size
 
     def test_step_returns_tuple(self):

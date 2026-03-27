@@ -16,7 +16,9 @@ class TestObservationBuilder:
         ego = VehicleState(x=100, lane=0, speed=20.0)
         obs = self.builder.build(ego, [])
         vec = obs.to_vector()
-        assert vec.shape == (3 + 4 * 4,)  # 3 ego + 4 neighbors * 4 features
+        ef = self.builder.config.ego_features
+        fpn = self.builder.config.features_per_neighbor
+        assert vec.shape == (ef + 4 * fpn,)  # ego + 4 neighbors * fpn features
 
     def test_obs_ego_values(self):
         ego = VehicleState(x=100, lane=1, speed=25.0)
@@ -39,11 +41,12 @@ class TestObservationBuilder:
         ego = VehicleState(x=100, lane=0, speed=20.0, vehicle_id=0)
         v1 = VehicleState(x=120, lane=0, speed=20.0, vehicle_id=1)
         obs = self.builder.build(ego, [v1])
+        fpn = self.builder.config.features_per_neighbor
         # Slot 0 has data, slots 1-3 should be zero
-        assert obs.neighbors[0, 3] == 1.0  # exists flag
-        assert obs.neighbors[1, 3] == 0.0  # padding
-        assert obs.neighbors[2, 3] == 0.0
-        assert obs.neighbors[3, 3] == 0.0
+        assert obs.neighbors[0, fpn - 1] == 1.0  # exists flag
+        assert obs.neighbors[1, fpn - 1] == 0.0  # padding
+        assert obs.neighbors[2, fpn - 1] == 0.0
+        assert obs.neighbors[3, fpn - 1] == 0.0
 
     def test_relative_values(self):
         ego = VehicleState(x=100, lane=1, speed=20.0, vehicle_id=0)
@@ -59,12 +62,15 @@ class TestObservationBuilder:
         others = [VehicleState(x=100 + i * 10, lane=0, speed=20.0,
                                vehicle_id=i+1) for i in range(10)]
         obs = self.builder.build(ego, others)
+        fpn = self.builder.config.features_per_neighbor
         # Should have exactly k=4 neighbors
-        exist_count = sum(obs.neighbors[:, 3] > 0.5)
+        exist_count = sum(obs.neighbors[:, fpn - 1] > 0.5)
         assert exist_count == 4
 
     def test_obs_size_property(self):
-        assert self.builder.obs_size == 3 + 4 * 4
+        ef = self.builder.config.ego_features
+        fpn = self.builder.config.features_per_neighbor
+        assert self.builder.obs_size == ef + 4 * fpn
 
 
 if __name__ == "__main__":

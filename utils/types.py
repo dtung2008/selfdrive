@@ -133,6 +133,9 @@ class VehicleState:
         x: Longitudinal position along the road (meters).
         lane: Lane index; 0 is the leftmost lane.
         speed: Current longitudinal speed (m/s, non-negative).
+        accel: Current longitudinal acceleration (m/s^2). Positive is
+            throttle, negative is braking. Stored so that observations
+            can include acceleration information.
         length: Bumper-to-bumper vehicle length (meters). Default 4.5 m
             (~typical sedan).
         width: Side-to-side vehicle width (meters). Default 2.0 m.
@@ -142,6 +145,7 @@ class VehicleState:
     x: float           # longitudinal position (meters)
     lane: int           # lane index (0 = leftmost)
     speed: float        # longitudinal speed (m/s)
+    accel: float = 0.0  # longitudinal acceleration (m/s^2)
     length: float = 4.5 # vehicle length (meters)
     width: float = 2.0  # vehicle width (meters)
     vehicle_id: int = 0
@@ -190,45 +194,47 @@ class Observation:
         ego_speed: Ego vehicle's current speed (m/s).
         ego_lane: Ego vehicle's current lane index.
         ego_x: Ego vehicle's longitudinal position (meters).
-        neighbors: Numpy array of shape ``(K, 4)`` holding the neighbour
+        ego_accel: Ego vehicle's current acceleration (m/s^2).
+        neighbors: Numpy array of shape ``(K, fpn)`` holding the neighbour
             feature rows described above.
     """
     ego_speed: float
     ego_lane: int
     ego_x: float
-    # For each of K neighbours: (rel_x, rel_lane, rel_speed, exists)
-    neighbors: np.ndarray  # shape (K, 4)
+    ego_accel: float = 0.0
+    # For each of K neighbours: (rel_x, rel_lane, rel_speed, rel_accel, exists)
+    neighbors: np.ndarray = None  # shape (K, fpn)
 
     def to_vector(self) -> np.ndarray:
         """Flatten the observation into a contiguous 1-D numpy array.
 
         The layout is::
 
-            [ego_speed, ego_lane, ego_x,
-             n0_rel_x, n0_rel_lane, n0_rel_speed, n0_exists,
-             n1_rel_x, n1_rel_lane, n1_rel_speed, n1_exists,
-             ...
-             nK_rel_x, nK_rel_lane, nK_rel_speed, nK_exists]
+            [ego_speed, ego_lane, ego_x, ego_accel,
+             n0_rel_x, n0_rel_lane, n0_rel_speed, n0_rel_accel, n0_exists,
+             ...]
 
         Returns:
-            np.ndarray: 1-D float array of length ``3 + K * 4``.
+            np.ndarray: 1-D float array of length ``ego_features + K * fpn``.
         """
-        # Pack the three ego scalars into a small array, then concatenate
-        # with the flattened neighbour matrix for a single contiguous vector.
-        ego = np.array([self.ego_speed, float(self.ego_lane), self.ego_x])
+        ego = np.array([self.ego_speed, float(self.ego_lane),
+                        self.ego_x, self.ego_accel])
         return np.concatenate([ego, self.neighbors.flatten()])
 
     @staticmethod
-    def vector_size(k_neighbors: int) -> int:
+    def vector_size(k_neighbors: int, ego_features: int = 3,
+                    features_per_neighbor: int = 4) -> int:
         """Compute the observation vector length for a given neighbour count.
 
         Args:
             k_neighbors: Number of neighbour slots (K).
+            ego_features: Number of ego state floats.
+            features_per_neighbor: Number of floats per neighbour slot.
 
         Returns:
-            int: Total vector length (``3 + k_neighbors * 4``).
+            int: Total vector length.
         """
-        return 3 + k_neighbors * 4
+        return ego_features + k_neighbors * features_per_neighbor
 
 
 # ---------------------------------------------------------------------------

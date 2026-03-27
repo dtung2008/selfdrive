@@ -35,7 +35,7 @@ def main():
     cfg.traffic.personality_std = 0.0
     cfg.sim.episode_steps = 200
     cfg.obs.k_neighbors = 4
-    obs_dim = 3 + 4 * 4  # ego (speed, lane, x) + 4 neighbor slots x 4 features
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
 
     # --- Collect expert demonstrations and train a world model ---
     # 30 expert episodes give ~6000 transitions -- enough for a small WM.
@@ -48,7 +48,9 @@ def main():
     # Small attention WM (64-dim, 2 layers) -- intentionally limited so that
     # error compounding is visible at moderate horizons.
     wm = AttentionWorldModel(embed_dim=64, num_heads=4, num_layers=2,
-                              max_vehicles=5, num_actions=9)
+                              max_vehicles=5, num_actions=9,
+                              ego_features=cfg.obs.ego_features,
+                              features_per_neighbor=cfg.obs.features_per_neighbor)
     wm_trainer = WorldModelTrainer(wm, lr=3e-4, batch_size=64)
     wm_trainer.train(obs_data, act_data, nobs_data, num_epochs=80, verbose=False)
     print("WM trained.\n")
@@ -82,6 +84,7 @@ def main():
             planner = PlannerLearnedModel(wm, mc, cfg.sim,
                                            road_config=cfg.road,
                                            normalizer=wm_trainer.normalizer,
+                                           obs_config=cfg.obs,
                                            seed=seed)
             sim = Simulator(cfg, seed=seed + 100)
             obs = sim.reset()

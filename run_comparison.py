@@ -89,6 +89,9 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     cfg = Config()
     cfg.road.num_lanes = args.num_lanes
     cfg.traffic.num_npcs = args.num_npcs
@@ -109,10 +112,10 @@ def main():
     mc.planner_num_rollouts = args.planner_rollouts
 
     # Observation dimensionality:
-    #   3 = ego features (speed, lane_position, lane_id)
-    #   + k_neighbors * 4 = for each nearby vehicle: (dx, dy, dvx, dvy)
+    #   ego_features = ego state floats (speed, lane_position, lane_id, ...)
+    #   + k_neighbors * features_per_neighbor = for each nearby vehicle
     # This flat vector is the input size for the policy and BC networks.
-    obs_dim = 3 + cfg.obs.k_neighbors * 4
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
 
     print("=" * 60)
     print(f"Self-Driving Simulator Comparison")
@@ -150,7 +153,7 @@ def main():
     # passed to every agent that uses this policy (BC agent, and later the RL
     # agent which is warm-started from BC weights).
     print(f"\n[3/5] Training Behavior Cloning ({args.bc_epochs} epochs)...")
-    bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
+    bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2).to(device)
     bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
     bc_losses, bc_normalizer = bc_trainer.train(obs_data, act_data,
                                   num_epochs=args.bc_epochs, verbose=True)
@@ -168,7 +171,9 @@ def main():
     world_model = AttentionWorldModel(
         embed_dim=mc.wm_embed_dim, num_heads=mc.wm_num_heads,
         num_layers=mc.wm_num_layers,
-        max_vehicles=mc.wm_max_vehicles, num_actions=9)
+        max_vehicles=mc.wm_max_vehicles, num_actions=9,
+        ego_features=cfg.obs.ego_features,
+        features_per_neighbor=cfg.obs.features_per_neighbor).to(device)
     wm_trainer = WorldModelTrainer(world_model, lr=3e-4, batch_size=64)
     wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                   num_epochs=args.wm_epochs, verbose=True)
@@ -219,6 +224,7 @@ def main():
                                            cfg.vehicle,
                                            road_config=cfg.road,
                                            normalizer=wm_trainer.normalizer,
+                                           obs_config=cfg.obs,
                                            seed=args.seed)
 
     # ---- Evaluate All Agents ----

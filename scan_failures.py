@@ -115,7 +115,9 @@ def build_agent(args, cfg, obs_dim):
         mc.planner_num_rollouts = args.planner_rollouts
         wm = AttentionWorldModel(embed_dim=mc.wm_embed_dim, num_heads=mc.wm_num_heads,
                                   num_layers=mc.wm_num_layers,
-                                  max_vehicles=mc.wm_max_vehicles, num_actions=9)
+                                  max_vehicles=mc.wm_max_vehicles, num_actions=9,
+                                  ego_features=cfg.obs.ego_features,
+                                  features_per_neighbor=cfg.obs.features_per_neighbor)
         wm_trainer = WorldModelTrainer(wm, lr=3e-4, batch_size=64)
         wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                       num_epochs=args.wm_epochs, verbose=True)
@@ -124,6 +126,7 @@ def build_agent(args, cfg, obs_dim):
         planner = PlannerLearnedModel(wm, mc, cfg.sim, cfg.vehicle,
                                        road_config=cfg.road,
                                        normalizer=wm_trainer.normalizer,
+                                       obs_config=cfg.obs,
                                        seed=args.train_seed)
         return planner, expert, info
 
@@ -243,7 +246,7 @@ def main():
 
     seeds = parse_seed_range(args.seeds)
     cfg = make_config(args)
-    obs_dim = 3 + cfg.obs.k_neighbors * 4
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
     max_steps = cfg.sim.episode_steps
 
     # Seed training RNGs

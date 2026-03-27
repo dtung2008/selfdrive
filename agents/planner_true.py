@@ -195,7 +195,6 @@ class PlannerTrueModel(Agent):
             restore_state(), and step() methods.
         mc: ModelConfig containing planner_horizon, planner_num_rollouts,
             and planner_discount parameters.
-        rng: Seeded random number generator for reproducibility.
     """
 
     def __init__(self, simulator, model_config: ModelConfig = None,
@@ -212,7 +211,8 @@ class PlannerTrueModel(Agent):
         """
         self.sim = simulator
         self.mc = model_config or ModelConfig()
-        self.rng = np.random.RandomState(seed)
+        self.sample_rng = np.random.RandomState(seed)
+        self.select_rng = np.random.RandomState(seed + 1)
 
     def act(self, obs: np.ndarray) -> Action:
         """Select the best action via MPC with structured and random rollouts.
@@ -231,8 +231,6 @@ class PlannerTrueModel(Agent):
         """
         # Save the current simulator state so we can restore after rollouts
         snapshot = self.sim.clone_state()
-        best_reward = -float("inf")
-        best_first_action = Action()
         num_actions = Action.num_actions()
         horizon = self.mc.planner_horizon
         num_rollouts = self.mc.planner_num_rollouts
@@ -254,7 +252,7 @@ class PlannerTrueModel(Agent):
         # Tier 3: Random sequences to fill the remaining rollout budget.
         # These provide exploration diversity beyond the structured candidates.
         while len(candidates) < num_rollouts:
-            candidates.append(self.rng.randint(0, num_actions, size=horizon))
+            candidates.append(self.sample_rng.randint(0, num_actions, size=horizon))
 
         # Evaluate each candidate by rolling out in the real simulator
         all_rewards = []
@@ -287,9 +285,9 @@ class PlannerTrueModel(Agent):
         keep_candidates = [i for i in best_candidates
                            if all_first_actions[i].lateral.value == 0]
         if keep_candidates:
-            best_idx = self.rng.choice(keep_candidates)
+            best_idx = self.select_rng.choice(keep_candidates)
         else:
-            best_idx = self.rng.choice(best_candidates)
+            best_idx = self.select_rng.choice(best_candidates)
 
         # Restore the simulator to its original state before returning,
         # since only the first action will actually be applied externally

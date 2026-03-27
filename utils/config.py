@@ -224,17 +224,99 @@ class SimConfig:
 class ObservationConfig:
     """Controls the size of the fixed-length observation vector.
 
-    The observation includes ego state (3 floats) plus ``k_neighbors``
-    neighbour slots of 4 floats each, giving a total vector length of
-    ``3 + k_neighbors * 4``.  See :class:`utils.types.Observation` for the
-    full layout.
+    The observation includes ego state (``ego_features`` floats) plus
+    ``k_neighbors`` neighbour slots of ``features_per_neighbor`` floats
+    each, giving a total vector length of
+    ``ego_features + k_neighbors * features_per_neighbor``.
+
+    See :class:`utils.types.Observation` for the full layout.
 
     Attributes:
         k_neighbors: Number of nearest-neighbour vehicle slots to include
             in the observation.  Unused slots are zero-padded with an
             ``exists`` flag of 0.
+        ego_features: Number of floats describing the ego vehicle.
+        features_per_neighbor: Number of floats per neighbour slot
+            (including the ``exists`` flag).
     """
-    k_neighbors: int = 6            # number of nearest neighbors in obs
+    k_neighbors: int = 10           # number of nearest neighbors in obs
+    ego_features: int = 4           # [speed, lane, x, accel]
+    features_per_neighbor: int = 5  # [rel_x, rel_lane, rel_speed, rel_accel, exists]
+
+
+# ---------------------------------------------------------------------------
+# Expert agent parameters
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExpertConfig:
+    """Tunable parameters for the rule-based expert driver.
+
+    These constants govern longitudinal following, lane-change motivation,
+    emergency detection, and merge-gap safety thresholds.  Extracting them
+    here (rather than hard-coding in the agent) makes it easy to sweep
+    parameters or adapt the expert to different road configurations.
+
+    Attributes:
+        safe_distance: Desired following gap (m) behind a lead vehicle.
+        desired_speed: Target cruise speed (m/s) on an open road.
+        lane_change_gap: Minimum forward gap (m) in target lane for a
+            normal (non-emergency) lane change.
+        lane_change_cooldown: Minimum steps between consecutive lane
+            changes to prevent rapid oscillation.
+        min_improvement: Target lane must offer this much more room (m)
+            than the current lane to justify a lane change.
+        closing_speed_threshold: Minimum closing speed (m/s) to consider
+            a leader "actively blocking" (motivation trigger).
+        leader_range_factor: Multiplier on safe_distance that defines the
+            range within which a leader can trigger a lane change.
+        stuck_speed_deficit: Ego must be this many m/s below desired_speed
+            to qualify as "stuck behind" a slow leader.
+        emergency_gap_ahead: Minimum ahead gap (m) in target lane during
+            emergency mode (relaxed from normal thresholds).
+        emergency_gap_behind: Minimum behind gap (m) in target lane
+            during emergency mode.
+        normal_min_gap_ahead: Minimum ahead gap (m) for normal merges.
+        normal_min_gap_behind: Minimum behind gap (m) for normal merges.
+        stopping_buffer: Extra margin (m) added to the kinematic stopping
+            distance to cover vehicle length and discretisation error.
+        max_decel: Maximum deceleration (m/s^2) used in physics-based
+            stopping distance calculations.
+        speed_deadband_low: Accelerate when ego_speed < desired - this.
+        speed_deadband_high: Decelerate when ego_speed > desired + this.
+        cascade_accel_threshold: If 2nd leader's accel is below this
+            (m/s^2), treat it as braking and anticipate cascade.
+        critical_gap: Below this gap (m), brake even when closing speed
+            is within match_speed_deadband to prevent slow-drift collisions.
+        cascade_max_gap: Maximum gap (m) between 1st and 2nd leader for
+            cascade braking to apply.  Beyond this distance the 1st
+            leader has enough buffer to absorb the 2nd leader's braking.
+    """
+    safe_distance: float = 20.0
+    desired_speed: float = 30.0
+    lane_change_gap: float = 15.0
+    lane_change_cooldown: int = 10
+    min_improvement: float = 10.0
+    closing_speed_threshold: float = 2.0
+    leader_range_factor: float = 1.5
+    stuck_speed_deficit: float = 5.0
+    emergency_gap_ahead: float = 10.0
+    emergency_gap_behind: float = 5.0
+    normal_min_gap_ahead: float = 20.0
+    normal_min_gap_behind: float = 15.0
+    stopping_buffer: float = 10.0
+    max_decel: float = 5.0
+    speed_deadband_low: float = 0.5
+    speed_deadband_high: float = 2.0
+    cascade_accel_threshold: float = -2.0
+    cascade_max_gap: float = 40.0
+    match_speed_deadband: float = 1.0
+    critical_gap: float = 8.0
+    gap_projection_time: float = 2.0
+    urgency_escalation_steps: int = 50
+    max_urgency_escalation: float = 0.5
+    two_step_lookahead_factor: float = 0.5
+    proactive_lane_change_time: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +371,7 @@ class ModelConfig:
     wm_embed_dim: int = 64
     wm_num_heads: int = 4
     wm_num_layers: int = 2
-    wm_max_vehicles: int = 7  # ego + k_neighbors
+    wm_max_vehicles: int = 11  # ego + k_neighbors
 
     # -- Training hyper-parameters --
     learning_rate: float = 3e-4
@@ -323,6 +405,7 @@ class Config:
         traffic: NPC traffic and driving-model parameters.
         sim: Simulation timing and reward shaping.
         obs: Observation vector sizing.
+        expert: Expert agent decision parameters.
         model: Neural-network and planner hyper-parameters.
     """
     road: RoadConfig = field(default_factory=RoadConfig)
@@ -330,6 +413,7 @@ class Config:
     traffic: TrafficConfig = field(default_factory=TrafficConfig)
     sim: SimConfig = field(default_factory=SimConfig)
     obs: ObservationConfig = field(default_factory=ObservationConfig)
+    expert: ExpertConfig = field(default_factory=ExpertConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
 
 

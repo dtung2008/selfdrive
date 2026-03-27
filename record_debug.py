@@ -78,7 +78,7 @@ def make_config(args):
     return cfg
 
 
-def build_agent(args, cfg, obs_dim):
+def build_agent(args, cfg, obs_dim, device=None):
     """Build the requested agent, training if necessary.
 
     For the expert agent no training is needed -- it uses hand-crafted rules.
@@ -111,7 +111,7 @@ def build_agent(args, cfg, obs_dim):
     # in BCAgent with deterministic=True (argmax, no sampling).
     if args.agent == "bc":
         print(f"Training BC ({args.bc_epochs} epochs)...")
-        policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
+        policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2).to(device)
         trainer = BCTrainer(policy, lr=3e-4, batch_size=64)
         losses, normalizer = trainer.train(obs_data, act_data, num_epochs=args.bc_epochs, verbose=True)
         info["bc_final_loss"] = losses[-1]
@@ -125,7 +125,7 @@ def build_agent(args, cfg, obs_dim):
     # The final policy is evaluated deterministically through BCAgent.
     if args.agent == "rl":
         print(f"Training BC for warm-start ({args.bc_epochs} epochs)...")
-        bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2)
+        bc_policy = PolicyNetwork(obs_dim, hidden_dim=128, num_layers=2).to(device)
         bc_trainer = BCTrainer(bc_policy, lr=3e-4, batch_size=64)
         bc_trainer.train(obs_data, act_data, num_epochs=args.bc_epochs, verbose=False)
         bc_normalizer = bc_trainer.normalizer
@@ -166,7 +166,9 @@ def build_agent(args, cfg, obs_dim):
         mc.planner_num_rollouts = args.planner_rollouts
         wm = AttentionWorldModel(embed_dim=mc.wm_embed_dim, num_heads=mc.wm_num_heads,
                                   num_layers=mc.wm_num_layers,
-                                  max_vehicles=mc.wm_max_vehicles, num_actions=9)
+                                  max_vehicles=mc.wm_max_vehicles, num_actions=9,
+                                  ego_features=cfg.obs.ego_features,
+                                  features_per_neighbor=cfg.obs.features_per_neighbor).to(device)
         wm_trainer = WorldModelTrainer(wm, lr=3e-4, batch_size=64)
         wm_losses = wm_trainer.train(obs_data, act_data, nobs_data,
                                       num_epochs=args.wm_epochs, verbose=True)
@@ -175,6 +177,7 @@ def build_agent(args, cfg, obs_dim):
         return PlannerLearnedModel(wm, mc, cfg.sim, cfg.vehicle,
                                     road_config=cfg.road,
                                     normalizer=wm_trainer.normalizer,
+                                    obs_config=cfg.obs,
                                     seed=args.seed), info
 
     raise ValueError(f"Unknown agent: {args.agent}")
@@ -297,9 +300,9 @@ def main():
     args = parser.parse_args()
 
     cfg = make_config(args)
-    # Observation dimension: 3 ego features (x, lane, speed) plus 4 features
-    # per neighbour (dx, lane, speed, id) for the k nearest NPCs.
-    obs_dim = 3 + cfg.obs.k_neighbors * 4
+    # Observation dimension: ego_features plus features_per_neighbor for
+    # each of the k nearest NPCs.
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
 
     # Seed all RNGs (Python, NumPy, PyTorch CPU+CUDA) for full reproducibility
     # of training and evaluation.
@@ -310,9 +313,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.train_seed)
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     # Build the agent (may involve training) and a separate expert instance
     # that will be queried in parallel during recording for comparison.
-    agent, agent_info = build_agent(args, cfg, obs_dim)
+    agent, agent_info = build_agent(args, cfg, obs_dim, device)
     expert = ExpertAgent(obs_config=cfg.obs, num_lanes=cfg.road.num_lanes)
 
     # --- Record the episode ---

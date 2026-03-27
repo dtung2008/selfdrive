@@ -44,16 +44,17 @@ class TestVehicleState:
 
 class TestObservation:
     def test_to_vector_shape(self):
-        k = 6
+        k = 10
+        ef, fpn = 4, 5  # current defaults
         obs = Observation(ego_speed=20.0, ego_lane=1, ego_x=100.0,
-                          neighbors=np.zeros((k, 4)))
+                          ego_accel=0.0, neighbors=np.zeros((k, fpn)))
         vec = obs.to_vector()
-        assert vec.shape == (Observation.vector_size(k),)
-        assert len(vec) == 3 + k * 4
+        assert vec.shape == (Observation.vector_size(k, ef, fpn),)
+        assert len(vec) == ef + k * fpn
 
     def test_vector_size(self):
-        assert Observation.vector_size(6) == 27
-        assert Observation.vector_size(0) == 3
+        assert Observation.vector_size(6, 4, 5) == 34
+        assert Observation.vector_size(0, 4, 5) == 4
 
 
 class TestTrajectory:

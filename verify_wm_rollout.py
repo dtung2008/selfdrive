@@ -39,7 +39,7 @@ def main():
     cfg.traffic.personality_std = 0.0
     cfg.sim.episode_steps = 200
     cfg.obs.k_neighbors = 4
-    obs_dim = 3 + 4 * 4
+    obs_dim = cfg.obs.ego_features + cfg.obs.k_neighbors * cfg.obs.features_per_neighbor
     vc = cfg.vehicle
 
     expert = ExpertAgent(obs_config=cfg.obs, num_lanes=1)
@@ -49,7 +49,9 @@ def main():
     obs_data, act_data, _, nobs_data, _ = trajectories_to_arrays(trajs)
 
     wm = AttentionWorldModel(embed_dim=64, num_heads=4, num_layers=2,
-                              max_vehicles=5, num_actions=9)
+                              max_vehicles=5, num_actions=9,
+                              ego_features=cfg.obs.ego_features,
+                              features_per_neighbor=cfg.obs.features_per_neighbor)
     wm_trainer = WorldModelTrainer(wm, lr=3e-4, batch_size=64)
     wm_trainer.train(obs_data, act_data, nobs_data, num_epochs=80, verbose=False)
     normalizer = wm_trainer.normalizer

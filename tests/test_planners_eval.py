@@ -52,10 +52,12 @@ class TestPlannerTrueModel:
 
 class TestPlannerLearnedModel:
     def setup_method(self):
-        self.obs_dim = 27
+        ef, fpn, k = 4, 5, 10  # current defaults
+        self.obs_dim = ef + k * fpn  # 54
         self.wm = AttentionWorldModel(
             embed_dim=32, num_heads=4, num_layers=1,
-            max_vehicles=7, num_actions=9)
+            max_vehicles=k + 1, num_actions=9,
+            ego_features=ef, features_per_neighbor=fpn)
         mc = ModelConfig()
         mc.planner_horizon = 3
         mc.planner_num_rollouts = 5

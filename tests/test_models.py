@@ -13,7 +13,7 @@ from models.world_model import (
 
 class TestPolicyNetwork:
     def setup_method(self):
-        self.obs_dim = 27  # 3 + 6*4
+        self.obs_dim = 4 + 10 * 5  # ego_features + k * features_per_neighbor = 54
         self.policy = PolicyNetwork(self.obs_dim, hidden_dim=64, num_layers=2)
 
     def test_forward_shape(self):
@@ -68,11 +68,14 @@ class TestMultiHeadSelfAttention:
 
 class TestAttentionWorldModel:
     def setup_method(self):
-        self.k = 6
-        self.obs_dim = 3 + self.k * 4  # 27
+        self.k = 10
+        self.ef = 4   # ego_features
+        self.fpn = 5  # features_per_neighbor
+        self.obs_dim = self.ef + self.k * self.fpn  # 34
         self.wm = AttentionWorldModel(
             embed_dim=32, num_heads=4, num_layers=2,
-            max_vehicles=self.k + 1, num_actions=9)
+            max_vehicles=self.k + 1, num_actions=9,
+            ego_features=self.ef, features_per_neighbor=self.fpn)
 
     def test_forward_shape(self):
         obs = torch.randn(4, self.obs_dim)

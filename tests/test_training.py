@@ -47,7 +47,7 @@ class TestDataCollector:
 
 class TestBCTrainer:
     def test_loss_decreases(self):
-        obs_dim = 27
+        obs_dim = 54  # 4 + 10*5
         policy = PolicyNetwork(obs_dim, hidden_dim=32, num_layers=1)
         trainer = BCTrainer(policy, lr=1e-3, batch_size=16)
 
@@ -61,7 +61,7 @@ class TestBCTrainer:
 
     def test_overfits_small_data(self):
         """Should overfit to small dataset."""
-        obs_dim = 27
+        obs_dim = 54  # 4 + 10*5
         policy = PolicyNetwork(obs_dim, hidden_dim=64, num_layers=2)
         trainer = BCTrainer(policy, lr=1e-3, batch_size=8)
 
@@ -75,9 +75,10 @@ class TestBCTrainer:
 
 class TestWorldModelTrainer:
     def test_loss_decreases(self):
-        obs_dim = 27
+        obs_dim = 54  # 4 + 10*5
         wm = AttentionWorldModel(embed_dim=32, num_heads=4, num_layers=1,
-                                  max_vehicles=7, num_actions=9)
+                                  max_vehicles=11, num_actions=9,
+                                  ego_features=4, features_per_neighbor=5)
         trainer = WorldModelTrainer(wm, lr=1e-3, batch_size=16)
 
         np.random.seed(42)

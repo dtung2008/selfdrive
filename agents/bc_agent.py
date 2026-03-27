@@ -16,6 +16,7 @@ import numpy as np
 from agents.base import Agent
 from models.policy_net import PolicyNetwork
 from utils.types import Action
+from utils.config import ObservationConfig
 
 
 class BCAgent(Agent):
@@ -43,7 +44,8 @@ class BCAgent(Agent):
     """
 
     def __init__(self, policy: PolicyNetwork, deterministic: bool = True,
-                 normalizer=None, safety_override: bool = True):
+                 normalizer=None, safety_override: bool = True,
+                 obs_config: ObservationConfig = None):
         """Initialize the behavior cloning agent.
 
         Args:
@@ -54,11 +56,14 @@ class BCAgent(Agent):
                 that transforms raw observations before policy inference.
             safety_override: Whether to apply rule-based safety overrides
                 after the policy selects an action.
+            obs_config: Observation layout descriptor. If None, the default
+                ObservationConfig is used.
         """
         self.policy = policy
         self.deterministic = deterministic
         self.normalizer = normalizer
         self.safety_override = safety_override
+        self.obs_config = obs_config or ObservationConfig()
         # Infer the device from the policy's parameters so tensors are
         # created on the correct device (CPU or GPU)
         self.device = next(policy.parameters()).device
@@ -129,14 +134,14 @@ class BCAgent(Agent):
         """
         from utils.types import LongitudinalAction, LateralAction
 
+        ef = self.obs_config.ego_features
+        fpn = self.obs_config.features_per_neighbor
+
         # Extract ego vehicle state from the observation
         ego_speed = obs[0]
         ego_lane = int(round(obs[1]))
 
-        # Calculate the number of NPC vehicles in the observation.
-        # Each NPC occupies 4 fields: [rel_x, rel_lane, rel_speed, exists].
-        # The first 3 fields are ego state, so k = (obs_dim - 3) / 4.
-        k = (len(obs) - 3) // 4
+        k = self.obs_config.k_neighbors
 
         # Determine the target lane if a lane change is requested
         min_gap_ahead = float('inf')
@@ -151,11 +156,11 @@ class BCAgent(Agent):
         # physics-based stopping distance calculation.
         closing_speed_ahead = 0.0  # positive = ego approaching NPC
         for i in range(k):
-            base = 3 + i * 4
-            rel_x = obs[base]          # longitudinal distance (positive = ahead)
-            rel_lane = obs[base + 1]   # lane offset from ego
-            rel_speed = obs[base + 2]  # npc_speed - ego_speed (negative = closing)
-            exists = obs[base + 3]     # 1.0 if this NPC slot is occupied
+            base = ef + i * fpn
+            rel_x = obs[base]              # longitudinal distance (positive = ahead)
+            rel_lane = obs[base + 1]       # lane offset from ego
+            rel_speed = obs[base + 2]      # npc_speed - ego_speed (negative = closing)
+            exists = obs[base + fpn - 1]   # 1.0 if this NPC slot is occupied
 
             # Skip empty NPC slots (exists acts as a validity flag)
             if exists < 0.5:

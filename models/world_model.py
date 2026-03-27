@@ -27,7 +27,8 @@ Architecture overview:
      connection at the output level).
 
 Typical usage:
-    model = AttentionWorldModel(embed_dim=64, num_heads=4, num_layers=2)
+    model = AttentionWorldModel(embed_dim=64, num_heads=4, num_layers=2,
+                                ego_features=4, features_per_neighbor=5)
     predicted_next_obs = model(obs_batch, action_idx_batch)
 """
 import torch
@@ -53,8 +54,8 @@ class VehicleEmbedding(nn.Module):
 
         Args:
             feature_dim: Number of raw input features per vehicle
-                (e.g. 12 for ego: 3 state features + 9 action one-hot;
-                4 for neighbour: rel_x, rel_lane, rel_speed, exists).
+                (e.g. 13 for ego: 4 state features + 9 action one-hot;
+                5 for neighbour: rel_x, rel_lane, rel_speed, rel_vy, exists).
             embed_dim: Dimensionality of the output token vector.
         """
         super().__init__()
@@ -246,8 +247,10 @@ class AttentionWorldModel(nn.Module):
     and lane-change reactions.
 
     Input representation (flat observation vector):
-      - **Ego token features** (first 3 values): ``[ego_speed, ego_lane, ego_x]``
-      - **Neighbour i features** (4 values each): ``[rel_x, rel_lane, rel_speed, exists]``
+      - **Ego token features** (first ``ego_features`` values):
+        e.g. ``[ego_speed, ego_lane, ego_x, ...]``
+      - **Neighbour i features** (``features_per_neighbor`` values each):
+        e.g. ``[rel_x, rel_lane, rel_speed, ..., exists]``
         where ``exists`` is a binary indicator (1.0 if the neighbour slot
         is occupied, 0.0 if padding).
 
@@ -276,7 +279,9 @@ class AttentionWorldModel(nn.Module):
 
     def __init__(self, embed_dim: int = 64, num_heads: int = 4,
                  num_layers: int = 2, max_vehicles: int = 7,
-                 num_actions: int = 9):
+                 num_actions: int = 9,
+                 ego_features: int = 3,
+                 features_per_neighbor: int = 4):
         """Initialise the attention-based world model.
 
         Args:
@@ -287,18 +292,22 @@ class AttentionWorldModel(nn.Module):
                 Determines the sequence length for the transformer.
             num_actions: Number of discrete actions. The ego action is
                 one-hot encoded and appended to the ego feature vector.
+            ego_features: Number of raw ego state floats in the observation.
+            features_per_neighbor: Number of floats per neighbour slot
+                (including the exists flag).
         """
         super().__init__()
         self.max_vehicles = max_vehicles
         self.num_actions = num_actions
         self.embed_dim = embed_dim
+        self.ego_features = ego_features
+        self.features_per_neighbor = features_per_neighbor
 
         # --- Feature dimensions ---
-        # Ego raw features: 3 state values + one-hot action vector.
-        ego_feat_dim = 3 + num_actions
-        # Neighbour raw features: relative position, lane offset, relative
-        # speed, and an existence flag (1 if real, 0 if padding).
-        neighbor_feat_dim = 4
+        # Ego raw features: state values + one-hot action vector.
+        ego_feat_dim = ego_features + num_actions
+        # Neighbour raw features: rel_x, rel_lane, rel_speed, ..., exists.
+        neighbor_feat_dim = features_per_neighbor
 
         # Separate embedding layers because ego and neighbour feature
         # spaces have different dimensionalities.
@@ -317,11 +326,11 @@ class AttentionWorldModel(nn.Module):
         ])
 
         # --- Prediction heads (output residual deltas) ---
-        # Ego head outputs 3 values: (delta_speed, delta_lane, delta_x).
-        self.ego_head = nn.Linear(embed_dim, 3)
-        # Neighbour head outputs 3 values per neighbour:
-        # (delta_rel_x, delta_rel_lane, delta_rel_speed).
-        self.neighbor_head = nn.Linear(embed_dim, 3)
+        # Ego head outputs delta for each ego feature.
+        self.ego_head = nn.Linear(embed_dim, ego_features)
+        # Neighbour head outputs deltas for all features except the exists
+        # flag (which is not predicted).
+        self.neighbor_head = nn.Linear(embed_dim, features_per_neighbor - 1)
 
     def forward(self, obs: torch.Tensor,
                 action_idx: torch.Tensor) -> torch.Tensor:
@@ -333,8 +342,7 @@ class AttentionWorldModel(nn.Module):
 
         Args:
             obs: Flat observation tensor of shape ``(batch, obs_dim)``
-                where ``obs_dim = 3 + 4*k`` (3 ego features + 4 features
-                per neighbour).
+                where ``obs_dim = ego_features + features_per_neighbor*k``.
             action_idx: Integer action indices of shape ``(batch,)``.
 
         Returns:
@@ -355,20 +363,20 @@ class AttentionWorldModel(nn.Module):
 
         # --- Extract predictions from transformer output tokens ---
         # Token 0 is always the ego vehicle; tokens 1..k are neighbours.
-        ego_delta = self.ego_head(x[:, 0, :])       # (B, 3)
-        neighbor_delta = self.neighbor_head(x[:, 1:, :])  # (B, k, 3)
+        ego_delta = self.ego_head(x[:, 0, :])       # (B, ego_features)
+        neighbor_delta = self.neighbor_head(x[:, 1:, :])  # (B, k, features_per_neighbor-1)
 
         # --- Residual prediction: next_state = current_state + delta ---
         # For the ego vehicle, add predicted delta to current ego features.
         pred_ego = ego_feats + ego_delta
 
-        # For neighbours, only the first 3 channels (rel_x, rel_lane,
-        # rel_speed) are predicted as deltas. The 4th channel ("exists")
-        # is kept unchanged because vehicle presence is not predicted.
+        # For neighbours, all channels except the last (exists flag) are
+        # predicted as deltas. The exists flag is kept unchanged because
+        # vehicle presence is not predicted.
         pred_neighbors = neighbor_feats.clone()
-        pred_neighbors[:, :, :3] = neighbor_feats[:, :, :3] + neighbor_delta
+        pred_neighbors[:, :, :-1] = neighbor_feats[:, :, :-1] + neighbor_delta
 
-        # Re-flatten into the same observation format: [ego(3), neighbours(k*4)].
+        # Re-flatten into the same observation format: [ego, neighbours].
         pred_obs = torch.cat([
             pred_ego,
             pred_neighbors.reshape(B, -1),
@@ -440,8 +448,8 @@ class AttentionWorldModel(nn.Module):
 
         Returns:
             A tuple of four tensors:
-              - ego_feats: ``(batch, 3)`` -- raw ego state features.
-              - neighbor_feats: ``(batch, k, 4)`` -- raw neighbour features.
+              - ego_feats: ``(batch, ego_features)`` -- raw ego state features.
+              - neighbor_feats: ``(batch, k, features_per_neighbor)`` -- raw neighbour features.
               - tokens: ``(batch, 1+k, embed_dim)`` -- full token sequence
                 with ego at position 0 and neighbours at positions 1..k.
               - mask: ``(batch, 1+k)`` -- boolean mask (True = valid token).
@@ -450,11 +458,12 @@ class AttentionWorldModel(nn.Module):
         device = obs.device
 
         # --- Parse flat observation ---
-        # First 3 values are ego features: [speed, lane, x].
-        ego_feats = obs[:, :3]
-        # Remaining values are k neighbours, each with 4 features.
-        k = (obs.shape[1] - 3) // 4
-        neighbor_feats = obs[:, 3:].reshape(B, k, 4)
+        ef = self.ego_features
+        fpn = self.features_per_neighbor
+        ego_feats = obs[:, :ef]
+        # Remaining values are k neighbours, each with fpn features.
+        k = (obs.shape[1] - ef) // fpn
+        neighbor_feats = obs[:, ef:].reshape(B, k, fpn)
 
         # --- Build ego token ---
         # One-hot encode the action and concatenate to ego features so
@@ -462,16 +471,16 @@ class AttentionWorldModel(nn.Module):
         action_oh = F.one_hot(action_idx.long(),
                               self.num_actions).float()
 
-        ego_input = torch.cat([ego_feats, action_oh], dim=-1)  # (B, 3+num_actions)
+        ego_input = torch.cat([ego_feats, action_oh], dim=-1)  # (B, ef+num_actions)
         ego_tok = self.ego_embed(ego_input)  # (B, embed_dim)
         # Add type embedding for "ego" (index 0).
         ego_tok = ego_tok + self.type_embed(
             torch.zeros(B, dtype=torch.long, device=device))
 
         # --- Build neighbour tokens ---
-        # Reshape to (B*k, 4) for batch embedding, then back to (B, k, embed_dim).
+        # Reshape to (B*k, fpn) for batch embedding, then back to (B, k, embed_dim).
         n_tok = self.neighbor_embed(
-            neighbor_feats.reshape(B * k, 4)).reshape(B, k, -1)
+            neighbor_feats.reshape(B * k, fpn)).reshape(B, k, -1)
         # Add type embedding for "neighbour" (index 1). The unsqueeze(1)
         # broadcasts the same type vector across all k neighbour slots.
         n_tok = n_tok + self.type_embed(
@@ -482,9 +491,9 @@ class AttentionWorldModel(nn.Module):
         tokens = torch.cat([ego_tok.unsqueeze(1), n_tok], dim=1)  # (B, 1+k, embed_dim)
 
         # --- Build attention mask ---
-        # A neighbour is "real" when its exists flag (4th feature) > 0.5.
+        # A neighbour is "real" when its exists flag (last feature) > 0.5.
         # Padding slots (exists=0) will be masked out in attention.
-        neighbor_mask = neighbor_feats[:, :, 3] > 0.5  # (B, k)
+        neighbor_mask = neighbor_feats[:, :, fpn - 1] > 0.5  # (B, k)
         # Ego is always present, so its mask entry is always True.
         ego_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
         mask = torch.cat([ego_mask, neighbor_mask], dim=1)  # (B, 1+k)

@@ -55,29 +55,35 @@ class TestExpertAgent:
 
     def test_decelerates_near_slow_leader(self):
         """Should brake when close vehicle ahead is slower."""
+        ef = self.cfg.obs.ego_features
+        fpn = self.cfg.obs.features_per_neighbor
         obs = np.zeros(self.sim.obs_builder.obs_size, dtype=np.float32)
         obs[0] = 25.0   # ego speed
         obs[1] = 0.0     # ego lane
         obs[2] = 100.0   # ego x
         # First neighbor: close ahead, slower
-        obs[3] = 10.0   # rel_x = 10 (close)
-        obs[4] = 0.0     # same lane
-        obs[5] = -10.0   # rel_speed = -10 (leader is 10 m/s slower)
-        obs[6] = 1.0     # exists
+        base = ef
+        obs[base + 0] = 10.0    # rel_x = 10 (close)
+        obs[base + 1] = 0.0     # same lane
+        obs[base + 2] = -10.0   # rel_speed = -10 (leader is 10 m/s slower)
+        obs[base + fpn - 1] = 1.0  # exists
         action = self.expert.act(obs)
         assert action.longitudinal == LongitudinalAction.DECELERATE
 
     def test_lane_change_to_pass(self):
         """Should change lane when blocked by very slow leader in 2-lane road."""
+        ef = self.cfg.obs.ego_features
+        fpn = self.cfg.obs.features_per_neighbor
         obs = np.zeros(self.sim.obs_builder.obs_size, dtype=np.float32)
         obs[0] = 25.0
         obs[1] = 0.0
         obs[2] = 100.0
         # Slow leader close ahead in lane 0
-        obs[3] = 15.0    # rel_x = 15
-        obs[4] = 0.0      # same lane
-        obs[5] = -15.0    # leader is very slow
-        obs[6] = 1.0      # exists
+        base = ef
+        obs[base + 0] = 15.0     # rel_x = 15
+        obs[base + 1] = 0.0      # same lane
+        obs[base + 2] = -15.0    # leader is very slow
+        obs[base + fpn - 1] = 1.0  # exists
         action = self.expert.act(obs)
         # Should try to change to lane 1
         assert action.lateral == LateralAction.RIGHT

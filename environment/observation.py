@@ -52,7 +52,9 @@ class ObservationBuilder:
             The number of floats in the vector produced by
             ``Observation.to_vector()``.
         """
-        return Observation.vector_size(self.k)
+        return Observation.vector_size(
+            self.k, self.config.ego_features,
+            self.config.features_per_neighbor)
 
     def build(self, ego: VehicleState,
               others: List[VehicleState]) -> Observation:
@@ -76,19 +78,22 @@ class ObservationBuilder:
         # Sort others by distance to ego (closest first)
         sorted_others = sorted(others, key=lambda v: abs(v.x - ego.x))
 
-        # Pre-allocate a (k, 4) zero matrix; unfilled rows stay as zeros
+        # Pre-allocate a (k, fpn) zero matrix; unfilled rows stay as zeros
         # with exists_flag = 0, acting as padding for the neural network.
-        neighbors = np.zeros((self.k, 4), dtype=np.float32)
+        fpn = self.config.features_per_neighbor
+        neighbors = np.zeros((self.k, fpn), dtype=np.float32)
 
         for i, v in enumerate(sorted_others[:self.k]):
             neighbors[i, 0] = v.x - ego.x          # relative longitudinal position
             neighbors[i, 1] = v.lane - ego.lane     # relative lane index
             neighbors[i, 2] = v.speed - ego.speed   # relative speed
-            neighbors[i, 3] = 1.0                   # exists flag (real neighbor)
+            neighbors[i, 3] = v.accel - ego.accel   # relative acceleration
+            neighbors[i, fpn - 1] = 1.0             # exists flag (always last column)
 
         return Observation(
             ego_speed=ego.speed,
             ego_lane=ego.lane,
             ego_x=ego.x,
+            ego_accel=ego.accel,
             neighbors=neighbors,
         )
