@@ -276,19 +276,20 @@ python debug_planner_decision.py --seed 42 --debug-steps 50,100,150
 
 ## Performance Comparison
 
-Reward comparison across lane configurations (3 seeds each, 300 steps, h=30, r=50):
+Average reward across lane configurations (3 seeds each, 300 steps, planners use h=30, r=50):
 
-| Config | Expert | Planner True | Planner WM |
-|-----------|--------|--------------|------------|
-| 1L / 3NPC | 200.4 | 203.5 | 198.9 |
-| 2L / 6NPC | 117.4 | 239.7 | 246.9 |
-| 3L / 9NPC | 281.9 | 244.4 | 231.8 |
-| 4L / 12NPC | 204.9 | 242.2 | 237.5 |
+| Config | Expert | BC | Planner True | Planner WM |
+|-----------|--------|--------|--------------|------------|
+| 1L / 3NPC | 200.4 | 198.9 | 203.5 | 198.9 |
+| 2L / 6NPC | 117.4 | 215.5 | 239.7 | 246.9 |
+| 3L / 9NPC | 281.9 | 204.5 | 244.4 | 231.8 |
+| 4L / 12NPC | 204.9 | 189.6 | 242.2 | 237.5 |
 
 Key observations:
 - **1L**: All agents perform similarly (~200). Simple car-following is well-handled by all.
-- **2L**: Expert is volatile across seeds (33–271) while both planners are consistent (~230–240). Planner WM slightly outperforms planner true here.
-- **3L/4L**: Expert excels when its heuristics find good lanes (282–287) but can collapse on hard seeds (46). Planners are more consistent but capped at ~245 due to fixed-sequence action limitations.
+- **2L**: Expert is volatile across seeds (33–271) while BC and both planners are consistent. Planner WM slightly outperforms planner true here (247 vs 240).
+- **3L/4L**: Expert excels when its heuristics find good lanes (282–287) but can collapse on hard seeds (46). Planners are the most consistent (~240), while BC plateaus around 200.
+- **BC**: Zero collisions across all configs thanks to the safety override layer, but the MLP can't replicate multi-step lane-change reasoning, capping reward around 200.
 - **Planner WM vs True**: Remarkably close despite using a learned model trained for only 20 epochs.
 
 ## Key Design Decisions
