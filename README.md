@@ -1,5 +1,7 @@
 # Self-Driving Simulator
 
+[繁體中文版](讀我.md)
+
 A modular simulator for learning and comparing self-driving control strategies on a multi-lane highway. The project implements a complete pipeline from environment simulation through expert data collection, model training, and multi-agent evaluation.
 
 ## Overview
