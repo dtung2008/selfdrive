@@ -16,9 +16,9 @@ This project provides:
 
 | Agent | Type | Description |
 |---|---|---|
-| **Expert** | Rule-based | IDM-like longitudinal control with safe lane-change decisions. Used to generate demonstration data for supervised learning. |
+| **Expert** | Rule-based | Acceleration-aware longitudinal control with safe lane-change decisions, urgency escalation, and configurable parameters via `ExpertConfig`. Used to generate demonstration data for supervised learning. |
 | **Behavior Cloning (BC)** | Supervised | MLP policy trained to imitate the expert via cross-entropy loss with inverse-frequency class weighting for rare actions. |
-| **Planner (true model)** | MPC | Random-shooting model-predictive control using the real simulator's `clone_state`/`restore_state` for exact rollouts. Evaluates 9 maneuver templates over a configurable horizon. |
+| **Planner (true model)** | MPC | Random-shooting model-predictive control using the real simulator's `clone_state`/`restore_state` for exact rollouts. Evaluates 9 maneuver templates over a configurable horizon. Uses split RNGs for candidate generation vs. tie-breaking. |
 | **Planner (learned WM)** | MPC | Same MPC framework but replaces the simulator with a learned attention-based world model. Runs rollouts entirely in PyTorch for speed. |
 | **RL (REINFORCE)** | Policy gradient | MLP policy trained via REINFORCE with running baseline, advantage whitening, entropy bonus, and gradient clipping. |
 
@@ -51,14 +51,14 @@ Index formula: (longitudinal + 1) * 3 + (lateral + 1)
 
 ### Observation Space
 
-Fixed-size vector with ego state followed by K nearest neighbors (default K=6):
+Fixed-size vector with ego state followed by K nearest neighbors (default K=10):
 
 ```
-[ego_speed, ego_lane, ego_x,          # 3 values: ego state
- rel_x_1, rel_lane_1, rel_speed_1, exists_1,   # 4 values per neighbor
- rel_x_2, rel_lane_2, rel_speed_2, exists_2,   # sorted by distance
- ...                                             # zero-padded if < K
- rel_x_K, rel_lane_K, rel_speed_K, exists_K]   # total: 3 + 4*K = 27
+[ego_speed, ego_lane, ego_x, ego_accel,         # 4 values: ego state
+ rel_x_1, rel_lane_1, rel_speed_1, rel_accel_1, exists_1,   # 5 values per neighbor
+ rel_x_2, rel_lane_2, rel_speed_2, rel_accel_2, exists_2,   # sorted by distance
+ ...                                                          # zero-padded if < K
+ rel_x_K, rel_lane_K, rel_speed_K, rel_accel_K, exists_K]   # total: 4 + 5*K = 54
 ```
 
 ### Attention World Model
@@ -101,7 +101,7 @@ selfdrive/
 │   ├── types.py                     # Core dataclasses: Action, VehicleState, Observation,
 │   │                                #   Transition, Trajectory
 │   └── config.py                    # All hyperparameters: road, vehicle, traffic, sim,
-│                                    #   observation, model configs
+│                                    #   observation, model, expert configs
 ├── tests/                           # 103 unit tests covering all modules
 │   ├── test_types_config.py         # Action encoding, VehicleState, Observation, Config
 │   ├── test_road_vehicle.py         # Road geometry, VehicleDynamics step functions
@@ -142,7 +142,7 @@ pip install -r requirements.txt
 
 Dependencies:
 - `numpy >= 1.21` -- Array operations and linear algebra
-- `torch >= 2.0` -- Neural networks and autograd
+- `torch >= 2.0` -- Neural networks and autograd (CUDA used automatically when available)
 - `pytest >= 7.0` -- Test framework
 
 ## Running Tests
@@ -274,6 +274,23 @@ python debug_planner_decision.py --seed 42 --debug-steps stuck
 python debug_planner_decision.py --seed 42 --debug-steps 50,100,150
 ```
 
+## Performance Comparison
+
+Reward comparison across lane configurations (3 seeds each, 300 steps, h=30, r=50):
+
+| Config | Expert | Planner True | Planner WM |
+|-----------|--------|--------------|------------|
+| 1L / 3NPC | 200.4 | 203.5 | 198.9 |
+| 2L / 6NPC | 117.4 | 239.7 | 246.9 |
+| 3L / 9NPC | 281.9 | 244.4 | 231.8 |
+| 4L / 12NPC | 204.9 | 242.2 | 237.5 |
+
+Key observations:
+- **1L**: All agents perform similarly (~200). Simple car-following is well-handled by all.
+- **2L**: Expert is volatile across seeds (33–271) while both planners are consistent (~230–240). Planner WM slightly outperforms planner true here.
+- **3L/4L**: Expert excels when its heuristics find good lanes (282–287) but can collapse on hard seeds (46). Planners are more consistent but capped at ~245 due to fixed-sequence action limitations.
+- **Planner WM vs True**: Remarkably close despite using a learned model trained for only 20 epochs.
+
 ## Key Design Decisions
 
 ### Modularity
@@ -288,6 +305,21 @@ Every module has a clean interface and its own test file. Adding a new agent req
 - **Better RL** -- Swap `rl_trainer.py` internals (e.g., PPO); the `Agent` interface stays the same
 - **Richer world model** -- Add recurrence or graph attention to `world_model.py`; planner interface unchanged
 - **New traffic behaviors** -- Subclass `TrafficBehavior` and add to the behavior mix in `TrafficConfig`
+
+### CUDA Support
+
+All neural network models (PolicyNetwork, AttentionWorldModel) are automatically placed on CUDA when a GPU is available. Both `record_debug.py` and `run_comparison.py` detect the device at startup and pass it through to model creation. Trainers (`BCTrainer`, `WorldModelTrainer`, `RLTrainer`) and inference agents (`BCAgent`, `PlannerLearnedModel`) derive the device from model parameters, so tensors are moved automatically.
+
+### Expert Configuration
+
+The expert agent's behavior is fully parameterized via `ExpertConfig` in `utils/config.py`. Key parameters include:
+
+- **Gap thresholds**: `normal_min_gap_ahead/behind`, `emergency_gap_ahead/behind`, `critical_gap`
+- **Speed control**: `desired_speed`, `speed_deadband_low/high`, `max_decel`
+- **Lane changes**: `lane_change_gap`, `lane_change_cooldown`, `min_improvement`, `closing_speed_threshold`
+- **Urgency escalation**: `urgency_escalation_steps`, `max_urgency_escalation` — only relaxes the ahead gap (never the behind gap, which is a safety constraint)
+- **Lookahead**: `proactive_lane_change_time`, `two_step_lookahead_factor`, `gap_projection_time`
+- **Cascade detection**: `cascade_accel_threshold`, `cascade_max_gap`
 
 ### Reward Structure
 
