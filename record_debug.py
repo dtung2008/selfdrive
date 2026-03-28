@@ -30,6 +30,7 @@ Usage:
     python record_debug.py --agent bc --seed 0 --num-lanes 2 --bc-epochs 50
     python record_debug.py --agent planner_true --planner-horizon 30
     python record_debug.py --agent planner_wm --wm-epochs 80
+
 """
 import argparse
 import json

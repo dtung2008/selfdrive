@@ -2,7 +2,7 @@
 """
 Self-Driving Simulator: Train and compare all agent types.
 
-Pipeline overview (6 stages):
+Pipeline overview (5 stages):
   1. Expert agent        -- A hand-crafted, rule-based driver used as a
                             performance ceiling and as the teacher for
                             imitation learning.
@@ -196,9 +196,9 @@ def main():
                                            obs_config=cfg.obs,
                                            seed=args.seed)
 
-    # ---- Evaluate All Agents ----
+    # ---- 5. Evaluate All Agents ----
     print(f"\n{'='*60}")
-    print(f"Evaluating all agents ({args.eval_episodes} episodes each)...")
+    print(f"[5/5] Evaluating all agents ({args.eval_episodes} episodes each)...")
     print(f"{'='*60}")
 
     agents = {
