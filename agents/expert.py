@@ -398,7 +398,9 @@ class ExpertAgent(Agent):
             return safe_options[0][1]
 
         # Both directions viable — prefer the one with more room
-        if abs(safe_options[0][0] - safe_options[1][0]) > 5.0:
+        # Guard: inf - inf = nan; treat two infinite gaps as equal
+        gap_a, gap_b = safe_options[0][0], safe_options[1][0]
+        if (gap_a != float('inf') or gap_b != float('inf')) and abs(gap_a - gap_b) > 5.0:
             return max(safe_options, key=lambda x: x[0])[1]
         return random.choice(safe_options)[1]
 
